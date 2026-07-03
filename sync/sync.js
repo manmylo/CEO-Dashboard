@@ -78,7 +78,7 @@ const Q_PRODUCTS = `
         variants(first: 100) {
           nodes {
             id sku price inventoryQuantity
-            inventoryItem { unitCost { amount } }
+            inventoryItem { unitCost { amount } tracked }
           }
         }
       }
@@ -155,6 +155,7 @@ async function pull() {
         price: num(v.price),
         inventory: num(v.inventoryQuantity),
         cost: num(v.inventoryItem?.unitCost?.amount),
+        tracked: v.inventoryItem?.tracked !== false,
       });
     }
   }
@@ -282,8 +283,13 @@ function compute({ variantMap, orders }) {
       margin: p.revenue ? money((p.profit / p.revenue) * 100) : 0,
     }));
 
+  // Ending inventory retail value = on-hand qty × price, tracked variants only
+  // (matches Shopify Analytics' "ending_inventory_retail_value").
+  let endingInventoryRetailValue = 0;
   const deadStock = [], stockAlerts = [];
   for (const [vid, v] of variantMap) {
+    if (v.tracked && v.inventory >= 1) endingInventoryRetailValue += v.inventory * v.price;
+
     const sold90 = soldUnits90[vid] || 0;
     const sold30 = soldUnits30[vid] || 0;
     if (v.inventory > 0 && sold90 <= DEADSTOCK_MIN_UNITS) {
@@ -312,6 +318,7 @@ function compute({ variantMap, orders }) {
     returnsRate: money(returnsRate),
     topProducts, deadStock: deadStock.slice(0, 20), stockAlerts: stockAlerts.slice(0, 20),
     byRegion, byChannel, // both scoped to this month (MTD) — same window as mtd.sales
+    endingInventoryRetailValue: money(endingInventoryRetailValue),
     dailyTrend,
     insights: buildInsights({ mtdSales, margin, deadStock, stockAlerts, target: TARGET }),
   };
