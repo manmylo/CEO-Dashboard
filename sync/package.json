@@ -1,0 +1,12 @@
+{
+  "name": "gearevo-bi-sync",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "sync": "node sync.js"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.7.0"
+  }
+}

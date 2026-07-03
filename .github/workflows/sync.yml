@@ -1,0 +1,36 @@
+name: Gearevo BI nightly sync
+
+on:
+  schedule:
+    # 15:00 UTC = 11:00 PM Malaysia (MYT, UTC+8). Adjust if you like.
+    - cron: "0 15 * * *"
+  workflow_dispatch: {}   # lets you run it manually from the Actions tab
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install deps
+        working-directory: sync
+        run: npm install
+
+      - name: Run sync
+        working-directory: sync
+        env:
+          SHOP_DOMAIN: ${{ secrets.SHOP_DOMAIN }}
+          SHOP_TOKEN: ${{ secrets.SHOP_TOKEN }}
+          SHOP_API_VERSION: ${{ secrets.SHOP_API_VERSION }}
+          FIREBASE_SA: ${{ secrets.FIREBASE_SA }}
+          MONTHLY_TARGET: ${{ secrets.MONTHLY_TARGET }}
+          EMAILJS_SERVICE_ID: ${{ secrets.EMAILJS_SERVICE_ID }}
+          EMAILJS_TEMPLATE_ID: ${{ secrets.EMAILJS_TEMPLATE_ID }}
+          EMAILJS_PUBLIC_KEY: ${{ secrets.EMAILJS_PUBLIC_KEY }}
+          EMAILJS_PRIVATE_KEY: ${{ secrets.EMAILJS_PRIVATE_KEY }}
+          REPORT_TO: ${{ secrets.REPORT_TO }}
+        run: npm run sync
