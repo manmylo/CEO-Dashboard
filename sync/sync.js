@@ -169,9 +169,10 @@ function compute({ variantMap, orders }) {
   let todaySubtotal = 0, todayOrders = 0, todayRefunds = 0;
   let mtdSubtotal = 0, mtdOrders = 0, mtdCost = 0, mtdRefunds = 0;
   let refundTotal = 0, grossTotal = 0;
-  const byRegion = {}, byChannel = {};
+  const byRegion = {}, byChannel = {}; // scoped to this month (MTD) — see targetPct-style window below
   const soldUnits30 = {}, soldUnits90 = {};
   const profitByProduct = {};
+  const dailySubtotal = {}, dailyOrders = {}, dailyRefunds = {}; // per MYT day, for the trend chart
 
   for (const o of orders) {
     const created = new Date(o.createdAt);
@@ -183,13 +184,17 @@ function compute({ variantMap, orders }) {
     grossTotal += total;
     refundTotal += num(o.totalRefundedSet?.shopMoney?.amount);
 
-    const prov = o.shippingAddress?.province || "Unknown";
-    byRegion[prov] = (byRegion[prov] || 0) + total;
-    const ch = o.channelInformation?.channelDefinition?.channelName || "Lain-lain";
-    byChannel[ch] = (byChannel[ch] || 0) + total;
+    if (createdMonthKey === monthKey) {
+      const prov = o.shippingAddress?.province || "Unknown";
+      byRegion[prov] = (byRegion[prov] || 0) + total;
+      const ch = o.channelInformation?.channelDefinition?.channelName || "Lain-lain";
+      byChannel[ch] = (byChannel[ch] || 0) + total;
+    }
 
     // Sales: every order placed in the window counts on its ORDER date, incl. later-cancelled
     // ones — exactly like Shopify. A cancellation nets out via its refund below.
+    dailySubtotal[createdDateStr] = (dailySubtotal[createdDateStr] || 0) + subtotal;
+    dailyOrders[createdDateStr] = (dailyOrders[createdDateStr] || 0) + 1;
     if (createdDateStr === todayStr) { todaySubtotal += subtotal; todayOrders++; }
     if (createdMonthKey === monthKey) { mtdSubtotal += subtotal; mtdOrders++; }
 
@@ -198,7 +203,9 @@ function compute({ variantMap, orders }) {
       const refundAmt = (r.refundLineItems?.nodes || []).reduce(
         (s, rli) => s + num(rli.subtotalSet?.shopMoney?.amount), 0
       );
-      if (myDateStr(r.createdAt) === todayStr) todayRefunds += refundAmt;
+      const refundDateStr = myDateStr(r.createdAt);
+      dailyRefunds[refundDateStr] = (dailyRefunds[refundDateStr] || 0) + refundAmt;
+      if (refundDateStr === todayStr) todayRefunds += refundAmt;
       if (myMonthKey(r.createdAt) === monthKey) mtdRefunds += refundAmt;
     }
 
@@ -227,6 +234,16 @@ function compute({ variantMap, orders }) {
 
   const todaySales = todaySubtotal - todayRefunds;
   const mtdSales = mtdSubtotal - mtdRefunds;
+
+  // Recomputed fresh from Shopify on every run (not just today) so a day's numbers
+  // self-correct if a refund lands on it after the fact — see dailyRefunds above.
+  const dailyTrend = Object.keys({ ...dailySubtotal, ...dailyRefunds })
+    .sort()
+    .map((d) => ({
+      date: d,
+      todaySales: money((dailySubtotal[d] || 0) - (dailyRefunds[d] || 0)),
+      orders: dailyOrders[d] || 0,
+    }));
 
   const grossProfit = mtdSales - mtdCost;
   const margin = mtdSales ? (grossProfit / mtdSales) * 100 : 0;
@@ -268,7 +285,8 @@ function compute({ variantMap, orders }) {
     },
     returnsRate: money(returnsRate),
     topProducts, deadStock: deadStock.slice(0, 20), stockAlerts: stockAlerts.slice(0, 20),
-    byRegion, byChannel,
+    byRegion, byChannel, // both scoped to this month (MTD) — same window as mtd.sales
+    dailyTrend,
     insights: buildInsights({ mtdSales, margin, deadStock, stockAlerts, target: TARGET }),
   };
 }
@@ -318,12 +336,18 @@ async function sendEmail(m) {
 (async () => {
   const raw = await pull();
   const metrics = compute(raw);
-  await db.doc("dashboard/latest").set(metrics);
-  await db.doc(`daily/${metrics.date}`).set({
-    date: metrics.date, sales: metrics.mtd.sales, todaySales: metrics.today.sales,
-    orders: metrics.mtd.orders, margin: metrics.mtd.margin,
-  });
-  console.log("Firestore updated.");
+  const { dailyTrend, ...latest } = metrics;
+
+  // Re-write every day in the fetched window (not just today), so a day's doc
+  // self-corrects on later runs (e.g. a refund processed a day or two after the
+  // order) instead of staying frozen at whatever it looked like when it was "today".
+  const batch = db.batch();
+  batch.set(db.doc("dashboard/latest"), latest);
+  for (const day of dailyTrend) {
+    batch.set(db.doc(`daily/${day.date}`), day);
+  }
+  await batch.commit();
+  console.log(`Firestore updated (dashboard/latest + ${dailyTrend.length} daily docs).`);
   await sendEmail(metrics);
   console.log("Done ✅");
   process.exit(0);
