@@ -92,9 +92,16 @@ const Q_ORDERS = `
       nodes {
         id createdAt displayFinancialStatus
         totalPriceSet { shopMoney { amount } }
+        subtotalPriceSet { shopMoney { amount } }
         totalRefundedSet { shopMoney { amount } }
         shippingAddress { province }
         channelInformation { channelDefinition { channelName } }
+        refunds {
+          createdAt
+          refundLineItems(first: 250) {
+            nodes { subtotalSet { shopMoney { amount } } }
+          }
+        }
         lineItems(first: 50) {
           nodes {
             quantity
@@ -143,13 +150,24 @@ async function pull() {
 // ---------- compute ----------
 function money(n) { return Math.round(n * 100) / 100; }
 
+// ---------- Malaysia timezone (UTC+8) helpers ----------
+// Net sales matches Shopify Analytics:
+//   • sales (subtotal after discount) counted on the ORDER's created date (MYT)
+//   • returns counted on the REFUND's own created/processed date (MYT), NOT the order's date
+//   • order count INCLUDES cancelled orders (to match Shopify's order count)
+const MY_OFFSET_MS = 8 * 60 * 60 * 1000;
+function toMYT(dateInput) { return new Date(new Date(dateInput).getTime() + MY_OFFSET_MS); }
+function myDateStr(dateInput) { return toMYT(dateInput).toISOString().slice(0, 10); }
+function myMonthKey(dateInput) { return toMYT(dateInput).toISOString().slice(0, 7); }
+
 function compute({ variantMap, orders }) {
   const now = new Date();
-  const todayStr = now.toISOString().slice(0, 10);
-  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const nowMy = toMYT(now);
+  const todayStr = nowMy.toISOString().slice(0, 10);
+  const monthKey = nowMy.toISOString().slice(0, 7);
 
-  let todaySales = 0, todayOrders = 0;
-  let mtdSales = 0, mtdOrders = 0, mtdCost = 0;
+  let todaySubtotal = 0, todayOrders = 0, todayRefunds = 0;
+  let mtdSubtotal = 0, mtdOrders = 0, mtdCost = 0, mtdRefunds = 0;
   let refundTotal = 0, grossTotal = 0;
   const byRegion = {}, byChannel = {};
   const soldUnits30 = {}, soldUnits90 = {};
@@ -157,7 +175,10 @@ function compute({ variantMap, orders }) {
 
   for (const o of orders) {
     const created = new Date(o.createdAt);
+    const createdDateStr = myDateStr(created);
+    const createdMonthKey = myMonthKey(created);
     const total = num(o.totalPriceSet?.shopMoney?.amount);
+    const subtotal = num(o.subtotalPriceSet?.shopMoney?.amount);
     const ageDays = (now - created) / 864e5;
     grossTotal += total;
     refundTotal += num(o.totalRefundedSet?.shopMoney?.amount);
@@ -167,8 +188,19 @@ function compute({ variantMap, orders }) {
     const ch = o.channelInformation?.channelDefinition?.channelName || "Lain-lain";
     byChannel[ch] = (byChannel[ch] || 0) + total;
 
-    if (created.toISOString().slice(0, 10) === todayStr) { todaySales += total; todayOrders++; }
-    if (created >= monthStart) { mtdSales += total; mtdOrders++; }
+    // Sales: every order placed in the window counts on its ORDER date, incl. later-cancelled
+    // ones — exactly like Shopify. A cancellation nets out via its refund below.
+    if (createdDateStr === todayStr) { todaySubtotal += subtotal; todayOrders++; }
+    if (createdMonthKey === monthKey) { mtdSubtotal += subtotal; mtdOrders++; }
+
+    // Refunds: dated by the REFUND's own date, regardless of which day the order was created.
+    for (const r of o.refunds || []) {
+      const refundAmt = (r.refundLineItems?.nodes || []).reduce(
+        (s, rli) => s + num(rli.subtotalSet?.shopMoney?.amount), 0
+      );
+      if (myDateStr(r.createdAt) === todayStr) todayRefunds += refundAmt;
+      if (myMonthKey(r.createdAt) === monthKey) mtdRefunds += refundAmt;
+    }
 
     for (const li of o.lineItems?.nodes || []) {
       if (isExcluded(li.sku)) continue; // exclude services from product analytics
@@ -177,7 +209,7 @@ function compute({ variantMap, orders }) {
       const qty = num(li.quantity);
       const lineRev = num(li.discountedTotalSet?.shopMoney?.amount);
       const lineCost = (v?.cost || 0) * qty;
-      if (created >= monthStart) mtdCost += lineCost;
+      if (createdMonthKey === monthKey) mtdCost += lineCost;
 
       if (vid) {
         if (ageDays <= 30) soldUnits30[vid] = (soldUnits30[vid] || 0) + qty;
@@ -192,6 +224,9 @@ function compute({ variantMap, orders }) {
       profitByProduct[pid].units += qty;
     }
   }
+
+  const todaySales = todaySubtotal - todayRefunds;
+  const mtdSales = mtdSubtotal - mtdRefunds;
 
   const grossProfit = mtdSales - mtdCost;
   const margin = mtdSales ? (grossProfit / mtdSales) * 100 : 0;
