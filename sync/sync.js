@@ -465,30 +465,26 @@ async function runQuick() {
   const q = computeQuickToday(todayRaw);
   const inv = computeInventory(variantMap);
 
+  // dashboard/latest always gets a fresh write — Firestore bills per document
+  // touched, not per field, so writing every run costs exactly the same as
+  // writing conditionally, and it keeps "last synced" honest (a stale stamp
+  // otherwise looks indistinguishable from a broken/skipped run). The one
+  // write that's actually worth skipping is the separate daily/{date} doc,
+  // since that's a second, genuinely avoidable write when nothing sold.
   const prevSnap = await db.doc("dashboard/latest").get();
   const prev = prevSnap.exists ? prevSnap.data() : {};
-
   const salesChanged = prev.today?.sales !== q.today.sales || prev.today?.orders !== q.today.orders;
-  const invChanged = prev.endingInventoryRetailValue !== inv.endingInventoryRetailValue;
-
-  if (!salesChanged && !invChanged) {
-    console.log("Quick sync — no changes, write skipped.");
-    return;
-  }
-
-  const latestUpdate = { date: q.date, generatedAt: q.generatedAt };
-  if (salesChanged) latestUpdate.today = q.today;
-  if (invChanged) Object.assign(latestUpdate, inv);
 
   const batch = db.batch();
-  batch.set(db.doc("dashboard/latest"), latestUpdate, { merge: true });
+  batch.set(db.doc("dashboard/latest"),
+    { date: q.date, generatedAt: q.generatedAt, today: q.today, ...inv }, { merge: true });
   if (salesChanged) {
     batch.set(db.doc(`daily/${q.date}`),
       { date: q.date, todaySales: q.today.sales, orders: q.today.orders }, { merge: true });
   }
   await batch.commit();
-  console.log(`Quick sync — ${salesChanged ? `today RM${q.today.sales} (${q.today.orders} orders)` : "sales unchanged"}`
-    + `, ${invChanged ? `inventory RM${inv.endingInventoryRetailValue}` : "inventory unchanged"}.`);
+  console.log(`Quick sync — today RM${q.today.sales} (${q.today.orders} orders), `
+    + `inventory RM${inv.endingInventoryRetailValue}${salesChanged ? "" : " (sales unchanged, daily doc write skipped)"}.`);
 }
 
 // ---------- main ----------
