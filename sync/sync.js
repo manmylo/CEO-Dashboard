@@ -115,6 +115,25 @@ const Q_ORDERS = `
     }
   }`;
 
+// Lean order shape for quick (today-only) syncs — no lineItems/cost, since quick
+// runs only need net sales + order count, not margin/product analytics.
+const Q_ORDERS_QUICK = `
+  query($cursor: String, $q: String) {
+    orders(first: 50, after: $cursor, query: $q, sortKey: CREATED_AT) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        id createdAt
+        subtotalPriceSet { shopMoney { amount } }
+        refunds {
+          createdAt
+          refundLineItems(first: 250) {
+            nodes { subtotalSet { shopMoney { amount } } }
+          }
+        }
+      }
+    }
+  }`;
+
 // ---------- pull ----------
 const num = (x) => Number(x || 0);
 function daysAgoISO(n) { return new Date(Date.now() - n * 864e5).toISOString(); }
@@ -159,6 +178,13 @@ const MY_OFFSET_MS = 8 * 60 * 60 * 1000;
 function toMYT(dateInput) { return new Date(new Date(dateInput).getTime() + MY_OFFSET_MS); }
 function myDateStr(dateInput) { return toMYT(dateInput).toISOString().slice(0, 10); }
 function myMonthKey(dateInput) { return toMYT(dateInput).toISOString().slice(0, 7); }
+// The UTC instant corresponding to 00:00 MYT today — used to scope quick-sync's
+// Shopify query to "today only" instead of re-fetching 90 days of orders.
+function todayStartUtcISO() {
+  const nowMy = toMYT(new Date());
+  const wallClockUtcMs = Date.UTC(nowMy.getUTCFullYear(), nowMy.getUTCMonth(), nowMy.getUTCDate());
+  return new Date(wallClockUtcMs - MY_OFFSET_MS).toISOString();
+}
 
 function compute({ variantMap, orders }) {
   const now = new Date();
@@ -291,6 +317,42 @@ function compute({ variantMap, orders }) {
   };
 }
 
+// ---------- quick sync (today only — no product/90-day pull) ----------
+async function pullQuickToday() {
+  const startIso = todayStartUtcISO();
+  console.log(`Quick sync — fetching today's orders (since ${startIso})…`);
+  const created = await paginate(Q_ORDERS_QUICK, (d) => d.orders, { q: `created_at:>=${startIso}` });
+  const updated = await paginate(Q_ORDERS_QUICK, (d) => d.orders, { q: `updated_at:>=${startIso}` });
+  return { created, updated };
+}
+
+function computeQuickToday({ created, updated }) {
+  const todayStr = myDateStr(new Date());
+
+  let todaySubtotal = 0, todayOrders = 0;
+  for (const o of created) {
+    if (myDateStr(o.createdAt) !== todayStr) continue;
+    todaySubtotal += num(o.subtotalPriceSet?.shopMoney?.amount);
+    todayOrders++;
+  }
+
+  let todayRefunds = 0;
+  for (const o of updated) {
+    for (const r of o.refunds || []) {
+      if (myDateStr(r.createdAt) !== todayStr) continue;
+      todayRefunds += (r.refundLineItems?.nodes || []).reduce(
+        (s, rli) => s + num(rli.subtotalSet?.shopMoney?.amount), 0
+      );
+    }
+  }
+
+  return {
+    date: todayStr,
+    generatedAt: new Date().toISOString(),
+    today: { sales: money(todaySubtotal - todayRefunds), orders: todayOrders },
+  };
+}
+
 function buildInsights({ mtdSales, margin, deadStock, stockAlerts, target }) {
   const out = [];
   const pace = (mtdSales / target) * 100;
@@ -332,23 +394,60 @@ async function sendEmail(m) {
   console.log(res.ok ? "Email sent." : `Email failed: ${res.status} ${await res.text()}`);
 }
 
-// ---------- main ----------
-(async () => {
+// ---------- run modes ----------
+// FULL: once a day — full product + 90-day order pull, recomputes everything
+//   (mtd, margin, dead stock, top products, byRegion/byChannel, and the whole
+//   90-day daily trend so any day self-corrects for late refunds), sends the email.
+// QUICK: every other run — today's orders only, updates just today.sales/orders.
+// Which mode runs is decided by a Firestore flag (sync/state.lastFullSyncDate),
+// not by wall-clock time, so a missed/failed run can't skip the day's full sync.
+async function runFull() {
   const raw = await pull();
   const metrics = compute(raw);
   const { dailyTrend, ...latest } = metrics;
 
-  // Re-write every day in the fetched window (not just today), so a day's doc
-  // self-corrects on later runs (e.g. a refund processed a day or two after the
-  // order) instead of staying frozen at whatever it looked like when it was "today".
   const batch = db.batch();
   batch.set(db.doc("dashboard/latest"), latest);
   for (const day of dailyTrend) {
     batch.set(db.doc(`daily/${day.date}`), day);
   }
+  batch.set(db.doc("sync/state"), { lastFullSyncDate: metrics.date, lastFullSyncAt: metrics.generatedAt });
   await batch.commit();
-  console.log(`Firestore updated (dashboard/latest + ${dailyTrend.length} daily docs).`);
+  console.log(`Full sync — dashboard/latest + ${dailyTrend.length} daily docs.`);
   await sendEmail(metrics);
+}
+
+async function runQuick() {
+  const raw = await pullQuickToday();
+  const q = computeQuickToday(raw);
+
+  const batch = db.batch();
+  batch.set(db.doc("dashboard/latest"),
+    { today: q.today, date: q.date, generatedAt: q.generatedAt }, { merge: true });
+  batch.set(db.doc(`daily/${q.date}`),
+    { date: q.date, todaySales: q.today.sales, orders: q.today.orders }, { merge: true });
+  await batch.commit();
+  console.log(`Quick sync — today RM${q.today.sales} (${q.today.orders} orders).`);
+}
+
+// ---------- main ----------
+(async () => {
+  const forceFull = process.env.FORCE_FULL === "true";
+  const todayStr = myDateStr(new Date());
+
+  let mode = "quick";
+  if (forceFull) {
+    mode = "full";
+  } else {
+    const state = await db.doc("sync/state").get();
+    const lastFullSyncDate = state.exists ? state.data().lastFullSyncDate : null;
+    if (lastFullSyncDate !== todayStr) mode = "full";
+  }
+
+  console.log(`Mode: ${mode.toUpperCase()}${forceFull ? " (forced)" : ""}`);
+  if (mode === "full") await runFull();
+  else await runQuick();
+
   console.log("Done ✅");
   process.exit(0);
 })().catch((e) => { console.error(e); process.exit(1); });

@@ -1,10 +1,17 @@
-name: Gearevo BI nightly sync
+name: Gearevo BI sync
 
 on:
   schedule:
-    # 15:00 UTC = 11:00 PM Malaysia (MYT, UTC+8). Adjust if you like.
-    - cron: "0 15 * * *"
-  workflow_dispatch: {}   # lets you run it manually from the Actions tab
+    # Every 10 minutes. sync.js decides FULL vs QUICK itself via a Firestore
+    # flag (sync/state.lastFullSyncDate) — the first run after MYT midnight
+    # does the full product + 90-day pull, every other run is today-only.
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      full:
+        description: "Force a full sync (products + 90 days), ignoring the daily flag"
+        type: boolean
+        default: false
 
 jobs:
   sync:
@@ -33,4 +40,5 @@ jobs:
           EMAILJS_PUBLIC_KEY: ${{ secrets.EMAILJS_PUBLIC_KEY }}
           EMAILJS_PRIVATE_KEY: ${{ secrets.EMAILJS_PRIVATE_KEY }}
           REPORT_TO: ${{ secrets.REPORT_TO }}
+          FORCE_FULL: ${{ github.event.inputs.full }}
         run: npm run sync
