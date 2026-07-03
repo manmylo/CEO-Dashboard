@@ -26,6 +26,21 @@ const DEADSTOCK_DAYS = 90;      // window for "modal tidur" detection
 const DEADSTOCK_MIN_UNITS = 5;  // sold <= this in window = suspect
 const LOW_STOCK_DAYS = 14;      // stockout warning threshold
 
+// Ending inventory retail value only (not margin/dead-stock) — mirrors the
+// ShopifyQL query behind Shopify Analytics' own inventory report:
+//   FROM inventory SHOW ending_inventory_retail_value
+//   WHERE product_title NOT CONTAINS '...' HAVING ending_inventory_units >= 1
+// Case-sensitive substring match against the product title, same as ShopifyQL's
+// NOT CONTAINS. Verified against Shopify's own Analytics export.
+const INVENTORY_EXCLUDED_TITLES = [
+  "USED", "Test", "Hidden", "Gearevo Kydex", "PRE-ORDER", "Gearevo Belt",
+  "Servis Asah", "Service Asah", "Laser Engraving", "T-Shirt",
+  "Personalize Stylish", "Gearevo Cap", "Knife Sheath", "Kydex sheath for F. Herder",
+];
+function isInventoryExcludedTitle(title) {
+  return INVENTORY_EXCLUDED_TITLES.some((ex) => (title || "").includes(ex));
+}
+
 // ---------- firebase ----------
 admin.initializeApp({ credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SA)) });
 const db = admin.firestore();
@@ -74,7 +89,7 @@ const Q_PRODUCTS = `
     products(first: 25, after: $cursor) {
       pageInfo { hasNextPage endCursor }
       nodes {
-        id title productType
+        id title productType status
         variants(first: 100) {
           nodes {
             id sku price inventoryQuantity
@@ -156,6 +171,7 @@ async function pullProducts() {
         inventory: num(v.inventoryQuantity),
         cost: num(v.inventoryItem?.unitCost?.amount),
         tracked: v.inventoryItem?.tracked !== false,
+        status: p.status,
       });
     }
   }
@@ -176,12 +192,18 @@ async function pull() {
 // ---------- compute ----------
 function money(n) { return Math.round(n * 100) / 100; }
 
-// Ending inventory retail value = on-hand qty × price, tracked variants only
-// (matches Shopify Analytics' "ending_inventory_retail_value"). Shared by full
-// and quick syncs since it's live Shopify state, not order history.
+// Ending inventory retail value = on-hand qty × price, for ACTIVE, tracked,
+// non-excluded-title variants only (matches Shopify Analytics'
+// "ending_inventory_retail_value" — see INVENTORY_EXCLUDED_TITLES above).
+// This filtering is intentionally scoped to inventory value only — margin,
+// dead-stock and top-products keep using the unfiltered variantMap, since a
+// product going draft/archived mid-month shouldn't erase its cost history.
+// Shared by full and quick syncs since it's live Shopify state, not order history.
 function computeInventory(variantMap) {
   let value = 0;
   for (const v of variantMap.values()) {
+    if (v.status !== "ACTIVE") continue;
+    if (isInventoryExcludedTitle(v.productTitle)) continue;
     if (v.tracked && v.inventory >= 1) value += v.inventory * v.price;
   }
   return { endingInventoryRetailValue: money(value) };
