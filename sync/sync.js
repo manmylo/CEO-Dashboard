@@ -138,11 +138,11 @@ const Q_ORDERS_QUICK = `
 const num = (x) => Number(x || 0);
 function daysAgoISO(n) { return new Date(Date.now() - n * 864e5).toISOString(); }
 
-async function pull() {
-  console.log("Fetching products + cost + stock…");
+// variant GID -> details (incl. cost from inventoryItem.unitCost — inline, no extra call).
+// Products/inventory are LIVE Shopify state (not tied to the 90-day order window),
+// so this runs on every sync — quick and full — not just once a day.
+async function pullProducts() {
   const products = await paginate(Q_PRODUCTS, (d) => d.products);
-
-  // variant GID -> details (incl. cost from inventoryItem.unitCost — inline, no extra call)
   const variantMap = new Map();
   for (const p of products) {
     for (const v of p.variants.nodes) {
@@ -159,6 +159,12 @@ async function pull() {
       });
     }
   }
+  return variantMap;
+}
+
+async function pull() {
+  console.log("Fetching products + cost + stock…");
+  const variantMap = await pullProducts();
 
   console.log("Fetching orders (last 90 days)…");
   const q = `created_at:>=${daysAgoISO(DEADSTOCK_DAYS)}`;
@@ -169,6 +175,17 @@ async function pull() {
 
 // ---------- compute ----------
 function money(n) { return Math.round(n * 100) / 100; }
+
+// Ending inventory retail value = on-hand qty × price, tracked variants only
+// (matches Shopify Analytics' "ending_inventory_retail_value"). Shared by full
+// and quick syncs since it's live Shopify state, not order history.
+function computeInventory(variantMap) {
+  let value = 0;
+  for (const v of variantMap.values()) {
+    if (v.tracked && v.inventory >= 1) value += v.inventory * v.price;
+  }
+  return { endingInventoryRetailValue: money(value) };
+}
 
 // ---------- Malaysia timezone (UTC+8) helpers ----------
 // Net sales matches Shopify Analytics:
@@ -283,13 +300,8 @@ function compute({ variantMap, orders }) {
       margin: p.revenue ? money((p.profit / p.revenue) * 100) : 0,
     }));
 
-  // Ending inventory retail value = on-hand qty × price, tracked variants only
-  // (matches Shopify Analytics' "ending_inventory_retail_value").
-  let endingInventoryRetailValue = 0;
   const deadStock = [], stockAlerts = [];
   for (const [vid, v] of variantMap) {
-    if (v.tracked && v.inventory >= 1) endingInventoryRetailValue += v.inventory * v.price;
-
     const sold90 = soldUnits90[vid] || 0;
     const sold30 = soldUnits30[vid] || 0;
     if (v.inventory > 0 && sold90 <= DEADSTOCK_MIN_UNITS) {
@@ -318,7 +330,7 @@ function compute({ variantMap, orders }) {
     returnsRate: money(returnsRate),
     topProducts, deadStock: deadStock.slice(0, 20), stockAlerts: stockAlerts.slice(0, 20),
     byRegion, byChannel, // both scoped to this month (MTD) — same window as mtd.sales
-    endingInventoryRetailValue: money(endingInventoryRetailValue),
+    ...computeInventory(variantMap),
     dailyTrend,
     insights: buildInsights({ mtdSales, margin, deadStock, stockAlerts, target: TARGET }),
   };
@@ -425,16 +437,36 @@ async function runFull() {
 }
 
 async function runQuick() {
-  const raw = await pullQuickToday();
-  const q = computeQuickToday(raw);
+  // Orders (today only) and products/inventory (always live, not tied to the
+  // 90-day order window) both refresh every quick run.
+  const [todayRaw, variantMap] = await Promise.all([pullQuickToday(), pullProducts()]);
+  const q = computeQuickToday(todayRaw);
+  const inv = computeInventory(variantMap);
+
+  const prevSnap = await db.doc("dashboard/latest").get();
+  const prev = prevSnap.exists ? prevSnap.data() : {};
+
+  const salesChanged = prev.today?.sales !== q.today.sales || prev.today?.orders !== q.today.orders;
+  const invChanged = prev.endingInventoryRetailValue !== inv.endingInventoryRetailValue;
+
+  if (!salesChanged && !invChanged) {
+    console.log("Quick sync — no changes, write skipped.");
+    return;
+  }
+
+  const latestUpdate = { date: q.date, generatedAt: q.generatedAt };
+  if (salesChanged) latestUpdate.today = q.today;
+  if (invChanged) Object.assign(latestUpdate, inv);
 
   const batch = db.batch();
-  batch.set(db.doc("dashboard/latest"),
-    { today: q.today, date: q.date, generatedAt: q.generatedAt }, { merge: true });
-  batch.set(db.doc(`daily/${q.date}`),
-    { date: q.date, todaySales: q.today.sales, orders: q.today.orders }, { merge: true });
+  batch.set(db.doc("dashboard/latest"), latestUpdate, { merge: true });
+  if (salesChanged) {
+    batch.set(db.doc(`daily/${q.date}`),
+      { date: q.date, todaySales: q.today.sales, orders: q.today.orders }, { merge: true });
+  }
   await batch.commit();
-  console.log(`Quick sync — today RM${q.today.sales} (${q.today.orders} orders).`);
+  console.log(`Quick sync — ${salesChanged ? `today RM${q.today.sales} (${q.today.orders} orders)` : "sales unchanged"}`
+    + `, ${invChanged ? `inventory RM${inv.endingInventoryRetailValue}` : "inventory unchanged"}.`);
 }
 
 // ---------- main ----------
