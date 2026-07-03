@@ -89,7 +89,7 @@ const Q_PRODUCTS = `
     products(first: 25, after: $cursor) {
       pageInfo { hasNextPage endCursor }
       nodes {
-        id title productType status
+        id title productType
         variants(first: 100) {
           nodes {
             id sku price inventoryQuantity
@@ -171,7 +171,6 @@ async function pullProducts() {
         inventory: num(v.inventoryQuantity),
         cost: num(v.inventoryItem?.unitCost?.amount),
         tracked: v.inventoryItem?.tracked !== false,
-        status: p.status,
       });
     }
   }
@@ -192,17 +191,18 @@ async function pull() {
 // ---------- compute ----------
 function money(n) { return Math.round(n * 100) / 100; }
 
-// Ending inventory retail value = on-hand qty × price, for ACTIVE, tracked,
-// non-excluded-title variants only (matches Shopify Analytics'
-// "ending_inventory_retail_value" — see INVENTORY_EXCLUDED_TITLES above).
+// Ending inventory retail value = on-hand qty × price, tracked, non-excluded-
+// title variants only — mirrors the ShopifyQL report verbatim (see
+// INVENTORY_EXCLUDED_TITLES above): that WHERE clause has NO product-status
+// condition, so draft/archived products with stock are counted too — only
+// title and tracked/qty>=1 matter. Do not add a status filter here; that was
+// tried and undercounted vs. the real ShopifyQL "ending_inventory_retail_value".
 // This filtering is intentionally scoped to inventory value only — margin,
-// dead-stock and top-products keep using the unfiltered variantMap, since a
-// product going draft/archived mid-month shouldn't erase its cost history.
+// dead-stock and top-products keep using the unfiltered variantMap.
 // Shared by full and quick syncs since it's live Shopify state, not order history.
 function computeInventory(variantMap) {
   let value = 0;
   for (const v of variantMap.values()) {
-    if (v.status !== "ACTIVE") continue;
     if (isInventoryExcludedTitle(v.productTitle)) continue;
     if (v.tracked && v.inventory >= 1) value += v.inventory * v.price;
   }
