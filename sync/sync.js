@@ -13,6 +13,7 @@
  */
 
 import admin from "firebase-admin";
+import { isExcluded } from "./excluded-skus.js";
 
 // ---------- config ----------
 const SHOP = process.env.SHOP_DOMAIN;
@@ -97,6 +98,7 @@ const Q_ORDERS = `
         lineItems(first: 50) {
           nodes {
             quantity
+            sku
             discountedTotalSet { shopMoney { amount } }
             product { id title }
             variant { id }
@@ -118,6 +120,7 @@ async function pull() {
   const variantMap = new Map();
   for (const p of products) {
     for (const v of p.variants.nodes) {
+      if (isExcluded(v.sku)) continue; // services/add-ons: not stock items
       variantMap.set(v.id, {
         productId: p.id,
         productTitle: p.title,
@@ -168,6 +171,7 @@ function compute({ variantMap, orders }) {
     if (created >= monthStart) { mtdSales += total; mtdOrders++; }
 
     for (const li of o.lineItems?.nodes || []) {
+      if (isExcluded(li.sku)) continue; // exclude services from product analytics
       const vid = li.variant?.id;
       const v = vid ? variantMap.get(vid) : null;
       const qty = num(li.quantity);

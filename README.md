@@ -102,6 +102,15 @@ node --env-file=.env sync.js
 - **Phase 3:** customer segmentation (RFM/VIP), basket analysis, real LLM advisor
   (pipe the numbers to Gemini Flash free tier or Claude Haiku).
 
+## Excluded SKUs
+
+`sync/excluded-skus.js` lists service / add-on SKUs (Sharpening, Engraving, Kydex,
+etc.) plus the `GE-OID-1`…`GE-OID-100` range. These are dropped from **product
+analytics** (top products, profit, dead stock, stock alerts, velocity) so services
+don't pollute the numbers with fake 100% margins. They are **still counted in total
+sales / order counts** because that's real revenue. To exclude more later, just add
+the SKU string to `SERVICE_SKUS` in that file.
+
 ## Tuning
 
 In `sync/sync.js` top constants:
