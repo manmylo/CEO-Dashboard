@@ -242,6 +242,8 @@ function compute({ variantMap, orders }) {
   const profitByProduct = {};    // full 90-day window — dashboard's default "All" view
   const profitByProductMTD = {}; // this month only — used by the email report
   const dailySubtotal = {}, dailyOrders = {}, dailyRefunds = {}; // per MYT day, for the trend chart
+  const dailyProductProfit = {}; // { [date]: { [pid]: {title, profit, revenue, units} } } — lets the
+                                  // dashboard's "date range" filter aggregate any custom range client-side
 
   for (const o of orders) {
     const created = new Date(o.createdAt);
@@ -305,6 +307,12 @@ function compute({ variantMap, orders }) {
         profitByProductMTD[pid].revenue += lineRev;
         profitByProductMTD[pid].units += qty;
       }
+
+      const dayBucket = dailyProductProfit[createdDateStr] || (dailyProductProfit[createdDateStr] = {});
+      const dp = dayBucket[pid] || (dayBucket[pid] = { title, profit: 0, revenue: 0, units: 0 });
+      dp.profit += lineRev - lineCost;
+      dp.revenue += lineRev;
+      dp.units += qty;
     }
   }
 
@@ -313,12 +321,17 @@ function compute({ variantMap, orders }) {
 
   // Recomputed fresh from Shopify on every run (not just today) so a day's numbers
   // self-correct if a refund lands on it after the fact — see dailyRefunds above.
+  // `products` lets the dashboard's date-range filter sum any custom range
+  // client-side without a fresh Shopify pull — refreshed once/day (full sync).
   const dailyTrend = Object.keys({ ...dailySubtotal, ...dailyRefunds })
     .sort()
     .map((d) => ({
       date: d,
       todaySales: money((dailySubtotal[d] || 0) - (dailyRefunds[d] || 0)),
       orders: dailyOrders[d] || 0,
+      products: Object.entries(dailyProductProfit[d] || {}).map(([pid, p]) => ({
+        pid, title: p.title, profit: money(p.profit), revenue: money(p.revenue), units: p.units,
+      })),
     }));
 
   const grossProfit = mtdSales - mtdCost;
