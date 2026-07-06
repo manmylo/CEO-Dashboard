@@ -26,6 +26,8 @@ const DEADSTOCK_DAYS = 90;      // window for "modal tidur" detection
 const DEADSTOCK_MIN_UNITS = 5;  // sold <= this in window = suspect
 const LOW_STOCK_DAYS = 14;      // stockout warning threshold
 const EMAIL_HOUR_MYT = 8;       // send the daily report on the first run at/after this MYT hour
+const AT_RISK_DAYS = 180;       // repeat customer with no order in this long = at-risk (~6 months)
+const VIP_COUNT = 20;           // top N customers by lifetime spend
 
 // Ending inventory retail value only (not margin/dead-stock) — mirrors the
 // ShopifyQL query behind Shopify Analytics' own inventory report:
@@ -131,6 +133,26 @@ const Q_ORDERS = `
     }
   }`;
 
+// amountSpent/numberOfOrders are Shopify's own LIFETIME aggregates per customer —
+// not limited to the 90-day order window used elsewhere, so VIP ranking and
+// revenue concentration reflect true customer value, not just recent activity.
+const Q_CUSTOMERS = `
+  query($cursor: String) {
+    customers(first: 50, after: $cursor) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        displayName
+        email
+        createdAt
+        numberOfOrders
+        amountSpent { amount }
+        orders(first: 1, sortKey: CREATED_AT, reverse: true) {
+          nodes { createdAt }
+        }
+      }
+    }
+  }`;
+
 // Lean order shape for quick (today-only) syncs — no lineItems/cost, since quick
 // runs only need net sales + order count, not margin/product analytics.
 const Q_ORDERS_QUICK = `
@@ -178,6 +200,20 @@ async function pullProducts() {
   return variantMap;
 }
 
+// Customer segmentation — full-sync only (once/day), same cadence as margin/
+// dead-stock/top-products. Independent of the order/product pull above.
+async function pullCustomers() {
+  const customers = await paginate(Q_CUSTOMERS, (d) => d.customers);
+  return customers.map((c) => ({
+    name: c.displayName || "Pelanggan",
+    email: c.email || "",
+    createdAt: c.createdAt,
+    orders: Number(c.numberOfOrders || 0),
+    spent: num(c.amountSpent?.amount),
+    lastOrderAt: c.orders?.nodes?.[0]?.createdAt || null,
+  }));
+}
+
 async function pull() {
   console.log("Fetching products + cost + stock…");
   const variantMap = await pullProducts();
@@ -208,6 +244,36 @@ function computeInventory(variantMap) {
     if (v.tracked && v.inventory >= 1) value += v.inventory * v.price;
   }
   return { endingInventoryRetailValue: money(value) };
+}
+
+// Customer segmentation from Shopify's own lifetime aggregates (see Q_CUSTOMERS).
+// VIP = top spenders overall; at-risk = repeat customers (2+ orders) quiet for
+// AT_RISK_DAYS; revenue concentration = what share of all-time revenue the top
+// 5% of paying customers represent.
+function computeCustomerSegments(customers) {
+  const now = new Date();
+  const monthKey = myMonthKey(now);
+
+  const paying = customers.filter((c) => c.spent > 0);
+  const totalRevenue = paying.reduce((s, c) => s + c.spent, 0);
+  const bySpendDesc = [...paying].sort((a, b) => b.spent - a.spent);
+
+  const vip = bySpendDesc.slice(0, VIP_COUNT)
+    .map((c) => ({ name: c.name, email: c.email, spent: money(c.spent), orders: c.orders }));
+
+  const atRisk = customers
+    .filter((c) => c.orders >= 2 && c.lastOrderAt && (now - new Date(c.lastOrderAt)) / 864e5 >= AT_RISK_DAYS)
+    .sort((a, b) => b.spent - a.spent)
+    .slice(0, 20)
+    .map((c) => ({ name: c.name, email: c.email, spent: money(c.spent), lastOrderAt: myDateStr(c.lastOrderAt) }));
+
+  const newThisMonth = customers.filter((c) => c.createdAt && myMonthKey(c.createdAt) === monthKey).length;
+
+  const top5Count = Math.max(1, Math.ceil(bySpendDesc.length * 0.05));
+  const top5Revenue = bySpendDesc.slice(0, top5Count).reduce((s, c) => s + c.spent, 0);
+  const top5RevenuePct = totalRevenue ? money((top5Revenue / totalRevenue) * 100) : 0;
+
+  return { vip, atRisk, newThisMonth, top5RevenuePct, totalCustomers: customers.length };
 }
 
 // ---------- Malaysia timezone (UTC+8) helpers ----------
@@ -488,6 +554,18 @@ async function runFull() {
   const raw = await pull();
   const metrics = compute(raw);
   const { dailyTrend, ...latest } = metrics;
+
+  const customers = await pullCustomers();
+  latest.customerSegments = computeCustomerSegments(customers);
+  if (latest.customerSegments.newThisMonth > 0) {
+    latest.insights.push(`${latest.customerSegments.newThisMonth} pelanggan baru bulan ini.`);
+  }
+  if (latest.customerSegments.top5RevenuePct > 0) {
+    latest.insights.push(`${latest.customerSegments.top5RevenuePct}% jualan sepanjang masa datang daripada 5% pelanggan teratas.`);
+  }
+  if (latest.customerSegments.atRisk.length > 0) {
+    latest.insights.push(`${latest.customerSegments.atRisk.length} pelanggan berulang tiada order >6 bulan — pertimbang hubungi semula.`);
+  }
 
   const batch = db.batch();
   batch.set(db.doc("dashboard/latest"), latest);
