@@ -27,7 +27,10 @@ const ENDPOINT = `https://${SHOP}/admin/api/${VER}/graphql.json`;
 
 const DEADSTOCK_DAYS = 90;      // window for "modal tidur" detection
 const DEADSTOCK_MIN_UNITS = 5;  // sold <= this in window = suspect
-const LOW_STOCK_DAYS = 14;      // stockout warning threshold
+const LOW_STOCK_DAYS = 14;      // stockout warning threshold (inclusion cutoff)
+const CRITICAL_STOCK_DAYS = 7;  // <= this many days left = "kritikal" tier, else "amaran"
+const REORDER_LEAD_DAYS = 14;   // assumed supplier lead time for reorder-quantity suggestion
+const REORDER_BUFFER_DAYS = 30; // extra buffer stock to hold on top of lead time
 const EMAIL_HOUR_MYT = 8;       // send the daily report on the first run at/after this MYT hour
 const AT_RISK_DAYS = 180;       // repeat customer with no order in this long = at-risk (~6 months)
 const VIP_COUNT = 25;           // top N customers by lifetime spend
@@ -307,7 +310,7 @@ function compute({ variantMap, orders }) {
   let mtdSubtotal = 0, mtdOrders = 0, mtdCost = 0, mtdRefunds = 0;
   let refundTotal = 0, grossTotal = 0;
   const byRegion = {}, byChannel = {}; // scoped to this month (MTD) — see targetPct-style window below
-  const soldUnits30 = {}, soldUnits90 = {};
+  const soldUnits7 = {}, soldUnits30 = {}, soldUnits90 = {};
   const profitByProduct = {};    // full 90-day window — dashboard's default "All" view
   const profitByProductMTD = {}; // this month only — used by the email report
   const dailySubtotal = {}, dailyOrders = {}, dailyRefunds = {}; // per MYT day, for the trend chart
@@ -359,6 +362,7 @@ function compute({ variantMap, orders }) {
       if (createdMonthKey === monthKey) mtdCost += lineCost;
 
       if (vid) {
+        if (ageDays <= 7) soldUnits7[vid] = (soldUnits7[vid] || 0) + qty;
         if (ageDays <= 30) soldUnits30[vid] = (soldUnits30[vid] || 0) + qty;
         soldUnits90[vid] = (soldUnits90[vid] || 0) + qty;
       }
@@ -423,23 +427,60 @@ function compute({ variantMap, orders }) {
   const topProducts = rankProducts(profitByProduct);
   const topProductsMTD = rankProducts(profitByProductMTD);
 
-  const deadStock = [], stockAlerts = [];
+  const deadStock = [], stockAlerts = [], stockOut = [];
   for (const [vid, v] of variantMap) {
     const sold90 = soldUnits90[vid] || 0;
     const sold30 = soldUnits30[vid] || 0;
+    const sold7 = soldUnits7[vid] || 0;
     if (v.inventory > 0 && sold90 <= DEADSTOCK_MIN_UNITS) {
       deadStock.push({ title: v.productTitle, sku: v.sku, onHand: v.inventory,
         capital: money(v.inventory * v.cost), sold90d: sold90 });
     }
-    if (sold30 > 0) {
-      const daysLeft = Math.floor(v.inventory / (sold30 / 30));
+
+    const velocity7 = sold7 / 7;
+    const velocity30 = sold30 / 30;
+    const velocity = 0.6 * velocity7 + 0.4 * velocity30;
+
+    // Already out of stock (zero or negative — Shopify allows negative
+    // on-hand via oversold / "continue selling when out of stock") is a
+    // distinct, more urgent state than "running low" — it's not a forecast,
+    // it's a fact, and it deserves its own list rather than a nonsensical
+    // "-70 hari lagi" row in the forecasting table. Tracked + non-excluded
+    // only, same scope as the inventory-value calc, so untracked/service
+    // variants (which always read 0 but aren't real stock) don't flood it.
+    if (v.tracked && v.inventory <= 0 && !isInventoryExcludedTitle(v.productTitle)) {
+      const targetStock = velocity > 0 ? Math.ceil(velocity * (REORDER_LEAD_DAYS + REORDER_BUFFER_DAYS)) : 0;
+      stockOut.push({
+        title: v.productTitle, sku: v.sku, onHand: v.inventory, sold30,
+        reorderQty: Math.max(0, targetStock - v.inventory),
+      });
+      continue;
+    }
+
+    // Forecasting proper: only for items that still HAVE stock, projecting
+    // when they'll run out based on recency-weighted velocity (60% last-7-
+    // days, 40% last-30-days) so a genuine acceleration/slowdown shows up
+    // faster than a flat 30-day average would.
+    if (sold30 > 0 && v.inventory > 0) {
+      const daysLeft = Math.floor(v.inventory / velocity);
       if (daysLeft <= LOW_STOCK_DAYS) {
-        stockAlerts.push({ title: v.productTitle, sku: v.sku, onHand: v.inventory, daysLeft });
+        const trend = velocity7 > velocity30 * 1.2 ? "up" : velocity7 < velocity30 * 0.8 ? "down" : "steady";
+        const stockoutDate = myDateStr(new Date(now.getTime() + daysLeft * 864e5));
+        const targetStock = Math.ceil(velocity * (REORDER_LEAD_DAYS + REORDER_BUFFER_DAYS));
+        const reorderQty = Math.max(0, targetStock - v.inventory);
+        stockAlerts.push({
+          title: v.productTitle, sku: v.sku, onHand: v.inventory, daysLeft, stockoutDate, trend,
+          urgency: daysLeft <= CRITICAL_STOCK_DAYS ? "critical" : "warning",
+          reorderQty,
+        });
       }
     }
   }
   deadStock.sort((a, b) => b.capital - a.capital);
   stockAlerts.sort((a, b) => a.daysLeft - b.daysLeft);
+  // Most in-demand out-of-stock items first — that's the real restock priority
+  // once something's already at zero, not how far negative it happens to be.
+  stockOut.sort((a, b) => b.sold30 - a.sold30);
 
   return {
     generatedAt: now.toISOString(), date: todayStr,
@@ -454,10 +495,11 @@ function compute({ variantMap, orders }) {
     returnsRate: money(returnsRate),
     topProducts, topProductsMTD, // topProducts = full 90-day window (dashboard default); MTD = email only
     deadStock: deadStock.slice(0, 20), stockAlerts: stockAlerts.slice(0, 20),
+    stockOut: stockOut.slice(0, 30),
     byRegion, byChannel, // both scoped to this month (MTD) — same window as mtd.sales
     ...computeInventory(variantMap),
     dailyTrend,
-    insights: buildInsights({ mtdSales, margin, deadStock, stockAlerts, target: TARGET }),
+    insights: buildInsights({ mtdSales, margin, deadStock, stockAlerts, stockOut, target: TARGET }),
   };
 }
 
@@ -497,13 +539,24 @@ function computeQuickToday({ created, updated }) {
   };
 }
 
-function buildInsights({ mtdSales, margin, deadStock, stockAlerts, target }) {
+function buildInsights({ mtdSales, margin, deadStock, stockAlerts, stockOut, target }) {
   const out = [];
   const pace = (mtdSales / target) * 100;
   if (pace < 70) out.push(`Jualan bulan ini baru ${pace.toFixed(0)}% dari sasaran RM${target.toLocaleString()}. Perlu push.`);
   else if (pace >= 100) out.push(`Sasaran bulanan dah tercapai (${pace.toFixed(0)}%). Bagus!`);
   if (margin < 40) out.push(`Margin ${margin.toFixed(1)}% rendah — semak diskaun atau kos.`);
-  if (stockAlerts.length) out.push(`${stockAlerts.length} SKU akan habis stok dalam ${LOW_STOCK_DAYS} hari — buat pesanan.`);
+  if (stockOut?.length) {
+    const withDemand = stockOut.filter((s) => s.sold30 > 0).length;
+    out.push(withDemand
+      ? `${stockOut.length} SKU dah habis stok (${withDemand} ada jualan dalam 30 hari lepas) — reorder segera.`
+      : `${stockOut.length} SKU dah habis stok — semak sama ada perlu reorder atau discontinue.`);
+  }
+  if (stockAlerts.length) {
+    const critical = stockAlerts.filter((a) => a.urgency === "critical").length;
+    out.push(critical
+      ? `${stockAlerts.length} SKU akan habis stok dalam ${LOW_STOCK_DAYS} hari (${critical} kritikal, ≤${CRITICAL_STOCK_DAYS} hari) — buat pesanan.`
+      : `${stockAlerts.length} SKU akan habis stok dalam ${LOW_STOCK_DAYS} hari — buat pesanan.`);
+  }
   if (deadStock.length) {
     const tied = deadStock.reduce((s, d) => s + d.capital, 0);
     out.push(`RM${Math.round(tied).toLocaleString()} modal tidur dalam ${deadStock.length} SKU slow-moving — pertimbang clearance.`);
@@ -599,9 +652,21 @@ async function sendEmail(m, yesterday) {
     ``,
     `🏆 PRODUK`,
     `Top produk (bulan ini): ${topMTD?.title || "-"} — ${rm(topMTD?.profit || 0)} untung`,
-    m.stockAlerts.length ? `` : null,
-    m.stockAlerts.length ? `⚠️ STOK` : null,
-    m.stockAlerts.length ? `${m.stockAlerts.length} SKU hampir habis stok — semak dashboard` : null,
+    (m.stockAlerts.length || m.stockOut?.length) ? `` : null,
+    (m.stockAlerts.length || m.stockOut?.length) ? `⚠️ STOK` : null,
+    m.stockOut?.length ? (() => {
+      const withDemand = m.stockOut.filter((s) => s.sold30 > 0).length;
+      const worst = m.stockOut[0]; // pre-sorted by sold30 descending
+      const demandStr = withDemand ? ` (${withDemand} ada jualan dlm 30 hari)` : "";
+      return `Dah habis stok: ${m.stockOut.length} SKU${demandStr} — paling laku: ${worst.title} (${worst.sold30} unit/30hr, cadang pesan ${worst.reorderQty} unit)`;
+    })() : null,
+    m.stockAlerts.length ? (() => {
+      const critical = m.stockAlerts.filter((a) => a.urgency === "critical").length;
+      const worst = m.stockAlerts[0]; // pre-sorted by daysLeft ascending
+      const tierStr = critical ? `Hampir habis: ${m.stockAlerts.length} SKU (${critical} kritikal)` : `Hampir habis: ${m.stockAlerts.length} SKU`;
+      const daysStr = worst.daysLeft === 0 ? "dah habis" : `${worst.daysLeft} hari lagi`;
+      return `${tierStr} — paling mendesak: ${worst.title} (${daysStr}, habis ~${worst.stockoutDate}, cadang pesan ${worst.reorderQty} unit)`;
+    })() : null,
     ``,
     `📋 CADANGAN`,
     ...m.insights.map((i) => `• ${i}`),
@@ -665,6 +730,11 @@ async function runFull() {
       totalValue: money(latest.deadStock.reduce((s, d) => s + d.capital, 0)),
     },
     stockAlerts: (latest.stockAlerts || []).slice(0, 5),
+    stockOut: {
+      count: (latest.stockOut || []).length,
+      withRecentDemand: (latest.stockOut || []).filter((s) => s.sold30 > 0).length,
+      topDemand: (latest.stockOut || []).slice(0, 5),
+    },
     customerSegments: {
       newThisMonth: latest.customerSegments.newThisMonth,
       atRiskCount: latest.customerSegments.atRisk.length,
