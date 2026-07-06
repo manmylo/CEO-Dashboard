@@ -41,4 +41,5 @@ jobs:
           REPORT_TO: ${{ secrets.REPORT_TO }}
           FORCE_FULL: ${{ github.event.inputs.full }}
           FORCE_EMAIL: ${{ github.event.inputs.test_email }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: npm run sync

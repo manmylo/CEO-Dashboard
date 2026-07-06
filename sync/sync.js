@@ -10,9 +10,12 @@
  *   SHOP_DOMAIN, SHOP_TOKEN, SHOP_API_VERSION (e.g. 2026-01),
  *   FIREBASE_SA, MONTHLY_TARGET,
  *   EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, EMAILJS_PUBLIC_KEY, EMAILJS_PRIVATE_KEY, REPORT_TO
+ *   ANTHROPIC_API_KEY (optional — AI-generated advisor insights; falls back to
+ *   rule-based buildInsights() if unset or the call fails)
  */
 
 import admin from "firebase-admin";
+import Anthropic from "@anthropic-ai/sdk";
 import { isExcluded } from "./excluded-skus.js";
 
 // ---------- config ----------
@@ -508,6 +511,60 @@ function buildInsights({ mtdSales, margin, deadStock, stockAlerts, target }) {
   return out;
 }
 
+// ---------- AI-generated advisor commentary (Claude) ----------
+// Replaces the rule-based buildInsights() output above when available, using
+// the exact same array-of-strings shape so the dashboard's Penasihat panel
+// and the email's Cadangan section need no changes either way. Falls back to
+// the rule-based insights (already computed) if the key isn't configured or
+// the call fails — the sync never breaks because of an AI outage.
+async function generateAIInsights(context) {
+  if (!process.env.ANTHROPIC_API_KEY) {
+    console.log("AI insights skipped (ANTHROPIC_API_KEY not configured).");
+    return null;
+  }
+
+  try {
+    const anthropic = new Anthropic();
+    const response = await anthropic.messages.create({
+      model: "claude-opus-4-8",
+      max_tokens: 1024,
+      thinking: { type: "adaptive" },
+      system: `Anda seorang penasihat perniagaan (Chief Data Officer) untuk Gearevo, kedai pisau/gear di Malaysia yang berjualan melalui Shopify, Shopee, dan TikTok Shop.
+
+Tulis 3-6 pemerhatian ringkas dalam Bahasa Melayu perniagaan, gaya sama seperti: "Jualan bulan ini baru 45% dari sasaran RM120,000. Perlu push."
+
+Peraturan ketat:
+- Hanya guna nombor yang diberikan di bawah. JANGAN cipta angka, trend, atau nama produk yang tiada dalam data.
+- Jangan paksa buat pemerhatian untuk metrik yang tiada isu — utamakan yang paling penting dan actionable dahulu.
+- Setiap ayat pendek (1-2 ayat), sertakan cadangan tindakan jika berkaitan.
+- Sebut juga jika ada sesuatu yang positif, bukan sekadar masalah.`,
+      messages: [{
+        role: "user",
+        content: `Data perniagaan Gearevo untuk ${context.date}:\n\n${JSON.stringify(context, null, 2)}`,
+      }],
+      output_config: {
+        format: {
+          type: "json_schema",
+          schema: {
+            type: "object",
+            properties: { insights: { type: "array", items: { type: "string" } } },
+            required: ["insights"],
+            additionalProperties: false,
+          },
+        },
+      },
+    });
+
+    const textBlock = response.content.find((b) => b.type === "text");
+    const parsed = textBlock ? JSON.parse(textBlock.text) : null;
+    if (!parsed || !Array.isArray(parsed.insights) || !parsed.insights.length) return null;
+    return parsed.insights;
+  } catch (e) {
+    console.log(`AI insights failed, using rule-based fallback: ${e.message}`);
+    return null;
+  }
+}
+
 // ---------- email (EmailJS, server-side) ----------
 // Sent at 8am MYT, so "today" is barely a few hours old — the report is about
 // YESTERDAY's finished day (from daily/{yesterday}), not the in-progress today.
@@ -566,6 +623,34 @@ async function runFull() {
   if (latest.customerSegments.atRisk.length > 0) {
     latest.insights.push(`${latest.customerSegments.atRisk.length} pelanggan berulang tiada order >6 bulan — pertimbang hubungi semula.`);
   }
+
+  const last7 = dailyTrend.slice(-7).reduce((s, d) => s + d.todaySales, 0);
+  const prev7 = dailyTrend.slice(-14, -7).reduce((s, d) => s + d.todaySales, 0);
+  const aiInsights = await generateAIInsights({
+    date: latest.date,
+    today: latest.today,
+    yesterdaySales: latest.yesterdaySales,
+    mtd: latest.mtd,
+    returnsRate: latest.returnsRate,
+    weekOverWeek: {
+      last7DaysSales: money(last7),
+      prev7DaysSales: money(prev7),
+      changePct: prev7 ? money(((last7 - prev7) / prev7) * 100) : null,
+    },
+    topProductsMTD: (latest.topProductsMTD || []).slice(0, 5),
+    deadStock: {
+      count: latest.deadStock.length,
+      totalValue: money(latest.deadStock.reduce((s, d) => s + d.capital, 0)),
+    },
+    stockAlerts: (latest.stockAlerts || []).slice(0, 5),
+    customerSegments: {
+      newThisMonth: latest.customerSegments.newThisMonth,
+      atRiskCount: latest.customerSegments.atRisk.length,
+      top5RevenuePct: latest.customerSegments.top5RevenuePct,
+    },
+    endingInventoryRetailValue: latest.endingInventoryRetailValue,
+  });
+  if (aiInsights) latest.insights = aiInsights;
 
   const batch = db.batch();
   batch.set(db.doc("dashboard/latest"), latest);
