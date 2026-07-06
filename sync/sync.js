@@ -27,7 +27,7 @@ const DEADSTOCK_MIN_UNITS = 5;  // sold <= this in window = suspect
 const LOW_STOCK_DAYS = 14;      // stockout warning threshold
 const EMAIL_HOUR_MYT = 8;       // send the daily report on the first run at/after this MYT hour
 const AT_RISK_DAYS = 180;       // repeat customer with no order in this long = at-risk (~6 months)
-const VIP_COUNT = 20;           // top N customers by lifetime spend
+const VIP_COUNT = 25;           // top N customers by lifetime spend
 
 // Ending inventory retail value only (not margin/dead-stock) — mirrors the
 // ShopifyQL query behind Shopify Analytics' own inventory report:
