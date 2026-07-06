@@ -219,6 +219,7 @@ const MY_OFFSET_MS = 8 * 60 * 60 * 1000;
 function toMYT(dateInput) { return new Date(new Date(dateInput).getTime() + MY_OFFSET_MS); }
 function myDateStr(dateInput) { return toMYT(dateInput).toISOString().slice(0, 10); }
 function myMonthKey(dateInput) { return toMYT(dateInput).toISOString().slice(0, 7); }
+function myYesterdayStr() { return myDateStr(new Date(Date.now() - 24 * 60 * 60 * 1000)); }
 // The UTC instant corresponding to 00:00 MYT today — used to scope quick-sync's
 // Shopify query to "today only" instead of re-fetching 90 days of orders.
 function todayStartUtcISO() {
@@ -238,7 +239,8 @@ function compute({ variantMap, orders }) {
   let refundTotal = 0, grossTotal = 0;
   const byRegion = {}, byChannel = {}; // scoped to this month (MTD) — see targetPct-style window below
   const soldUnits30 = {}, soldUnits90 = {};
-  const profitByProduct = {};
+  const profitByProduct = {};    // full 90-day window — dashboard's default "All" view
+  const profitByProductMTD = {}; // this month only — used by the email report
   const dailySubtotal = {}, dailyOrders = {}, dailyRefunds = {}; // per MYT day, for the trend chart
 
   for (const o of orders) {
@@ -296,6 +298,13 @@ function compute({ variantMap, orders }) {
       profitByProduct[pid].profit += lineRev - lineCost;
       profitByProduct[pid].revenue += lineRev;
       profitByProduct[pid].units += qty;
+
+      if (createdMonthKey === monthKey) {
+        profitByProductMTD[pid] = profitByProductMTD[pid] || { title, profit: 0, revenue: 0, units: 0 };
+        profitByProductMTD[pid].profit += lineRev - lineCost;
+        profitByProductMTD[pid].revenue += lineRev;
+        profitByProductMTD[pid].units += qty;
+      }
     }
   }
 
@@ -316,12 +325,14 @@ function compute({ variantMap, orders }) {
   const margin = mtdSales ? (grossProfit / mtdSales) * 100 : 0;
   const returnsRate = grossTotal ? (refundTotal / grossTotal) * 100 : 0;
 
-  const topProducts = Object.values(profitByProduct)
+  const rankProducts = (byProduct) => Object.values(byProduct)
     .sort((a, b) => b.profit - a.profit).slice(0, 20)
     .map((p) => ({
       title: p.title, profit: money(p.profit), revenue: money(p.revenue), units: p.units,
       margin: p.revenue ? money((p.profit / p.revenue) * 100) : 0,
     }));
+  const topProducts = rankProducts(profitByProduct);
+  const topProductsMTD = rankProducts(profitByProductMTD);
 
   const deadStock = [], stockAlerts = [];
   for (const [vid, v] of variantMap) {
@@ -351,7 +362,8 @@ function compute({ variantMap, orders }) {
       grossProfit: money(grossProfit), margin: money(margin),
     },
     returnsRate: money(returnsRate),
-    topProducts, deadStock: deadStock.slice(0, 20), stockAlerts: stockAlerts.slice(0, 20),
+    topProducts, topProductsMTD, // topProducts = full 90-day window (dashboard default); MTD = email only
+    deadStock: deadStock.slice(0, 20), stockAlerts: stockAlerts.slice(0, 20),
     byRegion, byChannel, // both scoped to this month (MTD) — same window as mtd.sales
     ...computeInventory(variantMap),
     dailyTrend,
@@ -410,17 +422,20 @@ function buildInsights({ mtdSales, margin, deadStock, stockAlerts, target }) {
 }
 
 // ---------- email (EmailJS, server-side) ----------
-async function sendEmail(m) {
+// Sent at 8am MYT, so "today" is barely a few hours old — the report is about
+// YESTERDAY's finished day (from daily/{yesterday}), not the in-progress today.
+async function sendEmail(m, yesterday) {
   const { EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, EMAILJS_PUBLIC_KEY, EMAILJS_PRIVATE_KEY, REPORT_TO } = process.env;
   if (!EMAILJS_SERVICE_ID || !REPORT_TO) { console.log("Email skipped (not configured)."); return; }
 
+  const topMTD = m.topProductsMTD?.[0] || m.topProducts?.[0]; // fall back for older cached metrics
   const body = [
     `Good morning Boss.`, ``,
-    `Jualan hari ini: RM${m.today.sales} (${m.today.orders} order)`,
+    `Jualan semalam (${yesterday.date}): RM${yesterday.todaySales} (${yesterday.orders} order)`,
     `Bulan ini: RM${m.mtd.sales} / RM${m.mtd.target} (${m.mtd.targetPct}%)`,
     `Margin: ${m.mtd.margin}%   Untung kasar: RM${m.mtd.grossProfit}`,
     `AOV: RM${m.mtd.aov}   Pulangan: ${m.returnsRate}%`, ``,
-    `Top produk untung: ${m.topProducts[0]?.title || "-"} (RM${m.topProducts[0]?.profit || 0})`,
+    `Top produk untung (bulan ini): ${topMTD?.title || "-"} (RM${topMTD?.profit || 0})`,
     m.stockAlerts.length ? `⚠️ Stock warning: ${m.stockAlerts.length} SKU bawah paras` : ``, ``,
     `Cadangan:`, ...m.insights.map((i) => `• ${i}`),
   ].filter(Boolean).join("\n");
@@ -430,7 +445,7 @@ async function sendEmail(m) {
     body: JSON.stringify({
       service_id: EMAILJS_SERVICE_ID, template_id: EMAILJS_TEMPLATE_ID,
       user_id: EMAILJS_PUBLIC_KEY, accessToken: EMAILJS_PRIVATE_KEY,
-      template_params: { to_email: REPORT_TO, subject: `Gearevo Report ${m.date}`, message: body },
+      template_params: { to_email: REPORT_TO, subject: `Gearevo Report ${yesterday.date}`, message: body },
     }),
   });
   console.log(res.ok ? "Email sent." : `Email failed: ${res.status} ${await res.text()}`);
@@ -500,31 +515,36 @@ async function runQuick() {
 // Shopify calls either way. `force` bypasses both the hour and once-per-day
 // checks for manual testing (FORCE_EMAIL=true) and never touches the flag.
 async function sendDailyEmailIfDue(freshMetrics, force) {
+  if (!force) {
+    const hourMy = toMYT(new Date()).getUTCHours();
+    if (hourMy < EMAIL_HOUR_MYT) {
+      console.log(`Email — not due yet (MYT hour ${hourMy} < ${EMAIL_HOUR_MYT}).`);
+      return;
+    }
+
+    const todayStr = myDateStr(new Date());
+    const state = (await db.doc("sync/state").get()).data() || {};
+    if (state.lastEmailDate === todayStr) {
+      console.log("Email — already sent today.");
+      return;
+    }
+  }
+
   const metrics = freshMetrics || (await db.doc("dashboard/latest").get()).data();
   if (!metrics) { console.log("Email — no dashboard data yet, skipping."); return; }
 
-  if (force) {
-    console.log("Email — forced test send.");
-    await sendEmail(metrics);
-    return;
-  }
+  const yesterdayStr = myYesterdayStr();
+  const yesterdaySnap = await db.doc(`daily/${yesterdayStr}`).get();
+  const yesterday = yesterdaySnap.exists
+    ? yesterdaySnap.data()
+    : { date: yesterdayStr, todaySales: 0, orders: 0 };
 
-  const hourMy = toMYT(new Date()).getUTCHours();
-  if (hourMy < EMAIL_HOUR_MYT) {
-    console.log(`Email — not due yet (MYT hour ${hourMy} < ${EMAIL_HOUR_MYT}).`);
-    return;
-  }
+  await sendEmail(metrics, yesterday);
+
+  if (force) { console.log("Email — forced test send."); return; }
 
   const todayStr = myDateStr(new Date());
-  const stateRef = db.doc("sync/state");
-  const state = (await stateRef.get()).data() || {};
-  if (state.lastEmailDate === todayStr) {
-    console.log("Email — already sent today.");
-    return;
-  }
-
-  await sendEmail(metrics);
-  await stateRef.set({ lastEmailDate: todayStr }, { merge: true });
+  await db.doc("sync/state").set({ lastEmailDate: todayStr }, { merge: true });
   console.log(`Email — sent for ${todayStr}.`);
 }
 
