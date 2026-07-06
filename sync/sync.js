@@ -334,6 +334,13 @@ function compute({ variantMap, orders }) {
       })),
     }));
 
+  // Yesterday's finished total, for the dashboard's live "vs semalam" comparison
+  // — pulled from dailyTrend (already computed above) instead of a second
+  // Firestore read. A fixed top-level field (not nested under `today`) so
+  // quick syncs' merge writes to `today` don't wipe it between full syncs.
+  const yesterdayEntry = dailyTrend.find((d) => d.date === myYesterdayStr());
+  const yesterdaySales = yesterdayEntry ? yesterdayEntry.todaySales : 0;
+
   const grossProfit = mtdSales - mtdCost;
   const margin = mtdSales ? (grossProfit / mtdSales) * 100 : 0;
   const returnsRate = grossTotal ? (refundTotal / grossTotal) * 100 : 0;
@@ -368,6 +375,7 @@ function compute({ variantMap, orders }) {
   return {
     generatedAt: now.toISOString(), date: todayStr,
     today: { sales: money(todaySales), orders: todayOrders },
+    yesterdaySales: money(yesterdaySales), // top-level — see note above dailyTrend/yesterdayEntry
     mtd: {
       sales: money(mtdSales), orders: mtdOrders,
       aov: mtdOrders ? money(mtdSales / mtdOrders) : 0,
@@ -442,9 +450,11 @@ async function sendEmail(m, yesterday) {
   if (!EMAILJS_SERVICE_ID || !REPORT_TO) { console.log("Email skipped (not configured)."); return; }
 
   const topMTD = m.topProductsMTD?.[0] || m.topProducts?.[0]; // fall back for older cached metrics
+  const changeStr = yesterday.changePct == null ? "" :
+    ` (${yesterday.changePct >= 0 ? "↑" : "↓"}${Math.abs(yesterday.changePct).toFixed(0)}%)`;
   const body = [
     `Good morning Boss.`, ``,
-    `Jualan semalam (${yesterday.date}): RM${yesterday.todaySales} (${yesterday.orders} order)`,
+    `Jualan semalam (${yesterday.date}): RM${yesterday.todaySales}${changeStr} (${yesterday.orders} order)`,
     `Bulan ini: RM${m.mtd.sales} / RM${m.mtd.target} (${m.mtd.targetPct}%)`,
     `Margin: ${m.mtd.margin}%   Untung kasar: RM${m.mtd.grossProfit}`,
     `AOV: RM${m.mtd.aov}   Pulangan: ${m.returnsRate}%`, ``,
@@ -547,10 +557,17 @@ async function sendDailyEmailIfDue(freshMetrics, force) {
   if (!metrics) { console.log("Email — no dashboard data yet, skipping."); return; }
 
   const yesterdayStr = myYesterdayStr();
-  const yesterdaySnap = await db.doc(`daily/${yesterdayStr}`).get();
+  const dayBeforeStr = myDateStr(new Date(Date.now() - 48 * 60 * 60 * 1000));
+  const [yesterdaySnap, dayBeforeSnap] = await Promise.all([
+    db.doc(`daily/${yesterdayStr}`).get(),
+    db.doc(`daily/${dayBeforeStr}`).get(),
+  ]);
   const yesterday = yesterdaySnap.exists
     ? yesterdaySnap.data()
     : { date: yesterdayStr, todaySales: 0, orders: 0 };
+  const dayBeforeSales = dayBeforeSnap.exists ? dayBeforeSnap.data().todaySales : 0;
+  // Finished day vs. finished day — always a fair comparison, unlike "today" mid-day.
+  yesterday.changePct = dayBeforeSales ? money(((yesterday.todaySales - dayBeforeSales) / dayBeforeSales) * 100) : null;
 
   await sendEmail(metrics, yesterday);
 
