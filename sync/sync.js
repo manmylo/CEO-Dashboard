@@ -25,6 +25,7 @@ const ENDPOINT = `https://${SHOP}/admin/api/${VER}/graphql.json`;
 const DEADSTOCK_DAYS = 90;      // window for "modal tidur" detection
 const DEADSTOCK_MIN_UNITS = 5;  // sold <= this in window = suspect
 const LOW_STOCK_DAYS = 14;      // stockout warning threshold
+const EMAIL_HOUR_MYT = 8;       // send the daily report on the first run at/after this MYT hour
 
 // Ending inventory retail value only (not margin/dead-stock) — mirrors the
 // ShopifyQL query behind Shopify Analytics' own inventory report:
@@ -438,10 +439,13 @@ async function sendEmail(m) {
 // ---------- run modes ----------
 // FULL: once a day — full product + 90-day order pull, recomputes everything
 //   (mtd, margin, dead stock, top products, byRegion/byChannel, and the whole
-//   90-day daily trend so any day self-corrects for late refunds), sends the email.
+//   90-day daily trend so any day self-corrects for late refunds).
 // QUICK: every other run — today's orders only, updates just today.sales/orders.
 // Which mode runs is decided by a Firestore flag (sync/state.lastFullSyncDate),
 // not by wall-clock time, so a missed/failed run can't skip the day's full sync.
+// The daily EmailJS report is separate from both — see sendDailyEmailIfDue —
+// since the CEO wants it at 8am MYT specifically, not whenever the full
+// analytics recompute happens to land (currently just after MYT midnight).
 async function runFull() {
   const raw = await pull();
   const metrics = compute(raw);
@@ -455,7 +459,7 @@ async function runFull() {
   batch.set(db.doc("sync/state"), { lastFullSyncDate: metrics.date, lastFullSyncAt: metrics.generatedAt });
   await batch.commit();
   console.log(`Full sync — dashboard/latest + ${dailyTrend.length} daily docs.`);
-  await sendEmail(metrics);
+  return metrics;
 }
 
 async function runQuick() {
@@ -485,11 +489,49 @@ async function runQuick() {
   await batch.commit();
   console.log(`Quick sync — today RM${q.today.sales} (${q.today.orders} orders), `
     + `inventory RM${inv.endingInventoryRetailValue}${salesChanged ? "" : " (sales unchanged, daily doc write skipped)"}.`);
+  return null;
+}
+
+// Sends the EmailJS report once per MYT calendar day, on the first run at/after
+// EMAIL_HOUR_MYT — tracked via sync/state.lastEmailDate so a missed run just
+// catches up on the next tick instead of skipping the day. Uses this run's
+// freshly computed full metrics if available (full-sync runs), otherwise reads
+// whatever's already sitting in dashboard/latest (quick-sync runs) — no extra
+// Shopify calls either way. `force` bypasses both the hour and once-per-day
+// checks for manual testing (FORCE_EMAIL=true) and never touches the flag.
+async function sendDailyEmailIfDue(freshMetrics, force) {
+  const metrics = freshMetrics || (await db.doc("dashboard/latest").get()).data();
+  if (!metrics) { console.log("Email — no dashboard data yet, skipping."); return; }
+
+  if (force) {
+    console.log("Email — forced test send.");
+    await sendEmail(metrics);
+    return;
+  }
+
+  const hourMy = toMYT(new Date()).getUTCHours();
+  if (hourMy < EMAIL_HOUR_MYT) {
+    console.log(`Email — not due yet (MYT hour ${hourMy} < ${EMAIL_HOUR_MYT}).`);
+    return;
+  }
+
+  const todayStr = myDateStr(new Date());
+  const stateRef = db.doc("sync/state");
+  const state = (await stateRef.get()).data() || {};
+  if (state.lastEmailDate === todayStr) {
+    console.log("Email — already sent today.");
+    return;
+  }
+
+  await sendEmail(metrics);
+  await stateRef.set({ lastEmailDate: todayStr }, { merge: true });
+  console.log(`Email — sent for ${todayStr}.`);
 }
 
 // ---------- main ----------
 (async () => {
   const forceFull = process.env.FORCE_FULL === "true";
+  const forceEmail = process.env.FORCE_EMAIL === "true";
   const todayStr = myDateStr(new Date());
 
   let mode = "quick";
@@ -502,8 +544,8 @@ async function runQuick() {
   }
 
   console.log(`Mode: ${mode.toUpperCase()}${forceFull ? " (forced)" : ""}`);
-  if (mode === "full") await runFull();
-  else await runQuick();
+  const metrics = mode === "full" ? await runFull() : await runQuick();
+  await sendDailyEmailIfDue(metrics, forceEmail);
 
   console.log("Done ✅");
   process.exit(0);

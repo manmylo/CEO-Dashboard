@@ -7,6 +7,10 @@ on:
         description: "Force a full sync (products + 90 days), ignoring the daily flag"
         type: boolean
         default: false
+      test_email:
+        description: "Force-send the EmailJS report right now, ignoring the 8am MYT / once-a-day gate"
+        type: boolean
+        default: false
 
 jobs:
   sync:
@@ -36,4 +40,5 @@ jobs:
           EMAILJS_PRIVATE_KEY: ${{ secrets.EMAILJS_PRIVATE_KEY }}
           REPORT_TO: ${{ secrets.REPORT_TO }}
           FORCE_FULL: ${{ github.event.inputs.full }}
+          FORCE_EMAIL: ${{ github.event.inputs.test_email }}
         run: npm run sync
