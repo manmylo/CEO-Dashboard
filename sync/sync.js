@@ -572,19 +572,41 @@ async function sendEmail(m, yesterday) {
   const { EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, EMAILJS_PUBLIC_KEY, EMAILJS_PRIVATE_KEY, REPORT_TO } = process.env;
   if (!EMAILJS_SERVICE_ID || !REPORT_TO) { console.log("Email skipped (not configured)."); return; }
 
+  // rm() matches the dashboard's own number formatting (thousand separators) —
+  // the plain concatenation here previously produced "RM2717" next to
+  // "RM104,884" from buildInsights(), an inconsistency that made the email
+  // harder to scan.
+  const rm = (n) => `RM${Number(n || 0).toLocaleString("en-MY", { maximumFractionDigits: 2 })}`;
   const topMTD = m.topProductsMTD?.[0] || m.topProducts?.[0]; // fall back for older cached metrics
   const changeStr = yesterday.changePct == null ? "" :
     ` (${yesterday.changePct >= 0 ? "↑" : "↓"}${Math.abs(yesterday.changePct).toFixed(0)}%)`;
-  const body = [
-    `Good morning Boss.`, ``,
-    `Jualan semalam (${yesterday.date}): RM${yesterday.todaySales}${changeStr} (${yesterday.orders} order)`,
-    `Bulan ini: RM${m.mtd.sales} / RM${m.mtd.target} (${m.mtd.targetPct}%)`,
-    `Margin: ${m.mtd.margin}%   Untung kasar: RM${m.mtd.grossProfit}`,
-    `AOV: RM${m.mtd.aov}   Pulangan: ${m.returnsRate}%`, ``,
-    `Top produk untung (bulan ini): ${topMTD?.title || "-"} (RM${topMTD?.profit || 0})`,
-    m.stockAlerts.length ? `⚠️ Stock warning: ${m.stockAlerts.length} SKU bawah paras` : ``, ``,
-    `Cadangan:`, ...m.insights.map((i) => `• ${i}`),
-  ].filter(Boolean).join("\n");
+
+  // `null` = conditionally omitted (e.g. no stock alerts); `""` = an
+  // intentional blank line for section spacing. Filtering strictly on `null`
+  // (not the old .filter(Boolean)) keeps the blank-line spacers — .filter(Boolean)
+  // was silently stripping every "" spacer too, which is why the email had no
+  // breathing room between sections at all.
+  const lines = [
+    `Good morning Boss.`,
+    ``,
+    `📊 JUALAN`,
+    `Semalam (${yesterday.date}): ${rm(yesterday.todaySales)}${changeStr} — ${yesterday.orders} order`,
+    `Bulan ini: ${rm(m.mtd.sales)} / ${rm(m.mtd.target)} (${m.mtd.targetPct}%)`,
+    ``,
+    `💰 UNTUNG`,
+    `Margin: ${m.mtd.margin}%   Untung Kasar: ${rm(m.mtd.grossProfit)}`,
+    `AOV: ${rm(m.mtd.aov)}   Pulangan: ${m.returnsRate}%`,
+    ``,
+    `🏆 PRODUK`,
+    `Top produk (bulan ini): ${topMTD?.title || "-"} — ${rm(topMTD?.profit || 0)} untung`,
+    m.stockAlerts.length ? `` : null,
+    m.stockAlerts.length ? `⚠️ STOK` : null,
+    m.stockAlerts.length ? `${m.stockAlerts.length} SKU hampir habis stok — semak dashboard` : null,
+    ``,
+    `📋 CADANGAN`,
+    ...m.insights.map((i) => `• ${i}`),
+  ];
+  const body = lines.filter((line) => line !== null).join("\n");
 
   const res = await fetch("https://api.emailjs.com/api/v1.0/email/send", {
     method: "POST", headers: { "Content-Type": "application/json" },
