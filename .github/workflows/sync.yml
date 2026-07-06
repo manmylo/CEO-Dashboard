@@ -1,11 +1,6 @@
 name: Gearevo BI sync
 
 on:
-  schedule:
-    # Every 10 minutes. sync.js decides FULL vs QUICK itself via a Firestore
-    # flag (sync/state.lastFullSyncDate) — the first run after MYT midnight
-    # does the full product + 90-day pull, every other run is today-only.
-    - cron: "*/10 * * * *"
   workflow_dispatch:
     inputs:
       full:
