@@ -796,8 +796,15 @@ Strict rules:
     });
 
     const textBlock = response.content.find((b) => b.type === "text");
-    const parsed = textBlock ? JSON.parse(textBlock.text) : null;
-    if (!parsed || !Array.isArray(parsed.insights) || !parsed.insights.length) return null;
+    if (!textBlock) {
+      console.log(`AI insights skipped: no text block in response (stop_reason: ${response.stop_reason}), using rule-based fallback.`);
+      return null;
+    }
+    const parsed = JSON.parse(textBlock.text);
+    if (!parsed || !Array.isArray(parsed.insights) || !parsed.insights.length) {
+      console.log(`AI insights skipped: response had no usable "insights" array, using rule-based fallback.`);
+      return null;
+    }
     return parsed.insights;
   } catch (e) {
     console.log(`AI insights failed, using rule-based fallback: ${e.message}`);
@@ -819,7 +826,7 @@ async function generateStrategicAnalysis(context) {
     const anthropic = new Anthropic();
     const response = await anthropic.messages.create({
       model: "claude-opus-4-8",
-      max_tokens: 1536,
+      max_tokens: 4096,
       thinking: { type: "adaptive" },
       system: `You are the Managing Director of Gearevo, a knife/gear retailer in Malaysia selling through Shopify, Shopee, and TikTok Shop. You are reviewing this snapshot to decide what to do next — not to describe the numbers, but to act on them.
 
@@ -862,8 +869,15 @@ Strict rules:
     });
 
     const textBlock = response.content.find((b) => b.type === "text");
-    const parsed = textBlock ? JSON.parse(textBlock.text) : null;
-    if (!parsed || !Array.isArray(parsed.analysis) || !parsed.analysis.length) return null;
+    if (!textBlock) {
+      console.log(`Strategic analysis skipped: no text block in response (stop_reason: ${response.stop_reason}).`);
+      return null;
+    }
+    const parsed = JSON.parse(textBlock.text);
+    if (!parsed || !Array.isArray(parsed.analysis) || !parsed.analysis.length) {
+      console.log(`Strategic analysis skipped: response had no usable "analysis" array.`);
+      return null;
+    }
     return parsed.analysis;
   } catch (e) {
     console.log(`Strategic analysis failed: ${e.message}`);
