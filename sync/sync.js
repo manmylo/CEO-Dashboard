@@ -120,6 +120,7 @@ const Q_ORDERS = `
         totalRefundedSet { shopMoney { amount } }
         shippingAddress { province }
         channelInformation { channelDefinition { channelName } }
+        customer { id }
         refunds {
           createdAt
           refundLineItems(first: 250) {
@@ -308,12 +309,24 @@ function compute({ variantMap, orders }) {
   const nowMy = toMYT(now);
   const todayStr = nowMy.toISOString().slice(0, 10);
   const monthKey = nowMy.toISOString().slice(0, 7);
+  // Previous calendar month, computed by decrementing rather than subtracting
+  // days, so it can't drift onto the wrong month across DST/day-boundary edge
+  // cases. Always well within the 90-day pull (last month is at most ~60 days back).
+  let lmYear = nowMy.getUTCFullYear(), lmMonth = nowMy.getUTCMonth() - 1;
+  if (lmMonth < 0) { lmMonth = 11; lmYear -= 1; }
+  const lastMonthKey = `${lmYear}-${String(lmMonth + 1).padStart(2, "0")}`;
 
   let todaySubtotal = 0, todayOrders = 0, todayRefunds = 0;
   let mtdSubtotal = 0, mtdOrders = 0, mtdCost = 0, mtdRefunds = 0;
   let mtdGrossTotal = 0, mtdRefundTotalOnOrder = 0;
   let refundTotal = 0, grossTotal = 0, cancelledOrders = 0;
   const byRegion = {}, byChannel = {}; // scoped to this month (MTD) — see targetPct-style window below
+  // Additional period buckets purely for the Business Analysis concentration
+  // filter (This Month / Last Month / Last 90 Days) — This Month reuses
+  // byChannel/profitByProductMTD above; these three are the missing periods.
+  const byChannelLastMonth = {}, byChannel90d = {};
+  const profitByProductLastMonth = {};
+  const customerRevMTD = {}, customerRevLastMonth = {}, customerRev90d = {}; // customerId -> revenue
   // Per-order-month counts (orders/returns/cancellations) across the whole
   // 90-day pull, not just the current month — this seeds up to ~3 months of
   // real history for the Business Analysis trend chart immediately, and gets
@@ -344,13 +357,22 @@ function compute({ variantMap, orders }) {
     if (o.cancelledAt) mstat.cancelledOrders++;
     if ((o.refunds || []).length > 0) mstat.returnOrders++; // "return order" = had at least one refund event, of any kind/reason
 
+    const ch = o.channelInformation?.channelDefinition?.channelName || "Other";
+    byChannel90d[ch] = (byChannel90d[ch] || 0) + total;
+
+    const custId = o.customer?.id || null; // guest/no-account orders are excluded from customer concentration
+    if (custId) customerRev90d[custId] = (customerRev90d[custId] || 0) + subtotal;
+
     if (createdMonthKey === monthKey) {
       const prov = o.shippingAddress?.province || "Unknown";
       byRegion[prov] = (byRegion[prov] || 0) + total;
-      const ch = o.channelInformation?.channelDefinition?.channelName || "Other";
       byChannel[ch] = (byChannel[ch] || 0) + total;
       mtdGrossTotal += total;
       mtdRefundTotalOnOrder += num(o.totalRefundedSet?.shopMoney?.amount);
+      if (custId) customerRevMTD[custId] = (customerRevMTD[custId] || 0) + subtotal;
+    } else if (createdMonthKey === lastMonthKey) {
+      byChannelLastMonth[ch] = (byChannelLastMonth[ch] || 0) + total;
+      if (custId) customerRevLastMonth[custId] = (customerRevLastMonth[custId] || 0) + subtotal;
     }
 
     // Sales: every order placed in the window counts on its ORDER date, incl. later-cancelled
@@ -398,6 +420,11 @@ function compute({ variantMap, orders }) {
         profitByProductMTD[pid].profit += lineRev - lineCost;
         profitByProductMTD[pid].revenue += lineRev;
         profitByProductMTD[pid].units += qty;
+      } else if (createdMonthKey === lastMonthKey) {
+        profitByProductLastMonth[pid] = profitByProductLastMonth[pid] || { title, profit: 0, revenue: 0, units: 0 };
+        profitByProductLastMonth[pid].profit += lineRev - lineCost;
+        profitByProductLastMonth[pid].revenue += lineRev;
+        profitByProductLastMonth[pid].units += qty;
       }
 
       const dayBucket = dailyProductProfit[createdDateStr] || (dailyProductProfit[createdDateStr] = {});
@@ -457,6 +484,49 @@ function compute({ variantMap, orders }) {
   // 20, so concentration ratios (e.g. "top 5 = X% of profit") must divide by
   // this, not by summing the already-capped array.
   const totalProfit90 = Object.values(profitByProduct).reduce((s, p) => s + p.profit, 0);
+
+  // Concentration risk, computed identically for each of the three periods —
+  // "how dependent is the business on its single biggest product/customer/
+  // channel," which only means something read against a specific window
+  // (a one-off big customer this month reads very differently from the same
+  // concentration holding steady over 90 days).
+  const productConcentration = (byProduct) => {
+    const total = Object.values(byProduct).reduce((s, p) => s + p.profit, 0);
+    const top5 = Object.values(byProduct).sort((a, b) => b.profit - a.profit).slice(0, 5)
+      .reduce((s, p) => s + p.profit, 0);
+    return total ? money((top5 / total) * 100) : 0;
+  };
+  const channelConcentration = (chans) => {
+    const entries = Object.entries(chans);
+    const total = entries.reduce((s, [, v]) => s + v, 0);
+    const top = entries.sort((a, b) => b[1] - a[1])[0];
+    return top && total ? { name: top[0], pct: money((top[1] / total) * 100) } : null;
+  };
+  const customerConcentration = (revByCustomer) => {
+    const entries = Object.entries(revByCustomer);
+    const total = entries.reduce((s, [, v]) => s + v, 0);
+    const sorted = entries.sort((a, b) => b[1] - a[1]);
+    const top5Count = Math.max(1, Math.ceil(sorted.length * 0.05));
+    const top5Rev = sorted.slice(0, top5Count).reduce((s, [, v]) => s + v, 0);
+    return total ? money((top5Rev / total) * 100) : 0;
+  };
+  const concentrationByPeriod = {
+    thisMonth: {
+      productPct: productConcentration(profitByProductMTD),
+      customerPct: customerConcentration(customerRevMTD),
+      channel: channelConcentration(byChannel),
+    },
+    lastMonth: {
+      productPct: productConcentration(profitByProductLastMonth),
+      customerPct: customerConcentration(customerRevLastMonth),
+      channel: channelConcentration(byChannelLastMonth),
+    },
+    last90d: {
+      productPct: productConcentration(profitByProduct),
+      customerPct: customerConcentration(customerRev90d),
+      channel: channelConcentration(byChannel90d),
+    },
+  };
 
   const deadStock = [], stockAlerts = [], stockOut = [];
   for (const [vid, v] of variantMap) {
@@ -537,7 +607,7 @@ function compute({ variantMap, orders }) {
     stockOut, // deadStock/stockOut unsliced — dashboard shows first 20 with a "see more" toggle for the rest
     byRegion, byChannel, // both scoped to this month (MTD) — same window as mtd.sales
     ...computeInventory(variantMap),
-    dailyTrend, monthlyOrderTrend, // both destructured back out in runFull() — not written to dashboard/latest directly
+    dailyTrend, monthlyOrderTrend, concentrationByPeriod, // all merged into businessAnalysis in runFull(), not written to dashboard/latest directly
     insights: buildInsights({ mtdSales, margin, deadStock, stockAlerts, stockOut, target: TARGET }),
   };
 }
@@ -608,8 +678,8 @@ function buildInsights({ mtdSales, margin, deadStock, stockAlerts, stockOut, tar
 // into a single "can this business sustain itself" snapshot — distinct from
 // the daily tactical Recommendations insights above. Full-sync only (needs
 // customerSegments, which requires the separate customer pull).
-function computeBusinessAnalysis({ dailyTrend, monthlyOrderTrend, totalProfit90, topProducts, deadStock, stockOut,
-  customerSegments, endingInventoryRetailValue, byChannel }) {
+function computeBusinessAnalysis({ dailyTrend, monthlyOrderTrend, deadStock, stockOut,
+  customerSegments, endingInventoryRetailValue }) {
   // Monthly trend: bucket the (up to 90-day) daily trend by calendar month.
   // Edge months are necessarily partial (whatever's inside the 90-day pull
   // window) — good enough for a direction-of-travel read, not a precise MoM %.
@@ -640,7 +710,6 @@ function computeBusinessAnalysis({ dailyTrend, monthlyOrderTrend, totalProfit90,
   const last30 = sorted.slice(-30).reduce((s, d) => s + d.todaySales, 0);
   const prev30 = sorted.slice(-60, -30).reduce((s, d) => s + d.todaySales, 0);
 
-  const top5Profit = topProducts.slice(0, 5).reduce((s, p) => s + p.profit, 0);
   const deadStockValue = deadStock.reduce((s, d) => s + d.capital, 0);
   // Proxy for revenue exposed by items currently unavailable: what their last
   // 30 days of demand would have been worth at their normal price — not an
@@ -649,26 +718,20 @@ function computeBusinessAnalysis({ dailyTrend, monthlyOrderTrend, totalProfit90,
   const stockOutRevenueAtRisk = stockOut.reduce((s, d) => s + d.sold30 * (d.price || 0), 0);
   const atRiskValue = customerSegments.atRisk.reduce((s, c) => s + c.spent, 0);
 
-  const channelEntries = Object.entries(byChannel || {});
-  const channelTotal = channelEntries.reduce((s, [, v]) => s + v, 0);
-  const topChannel = channelEntries.sort((a, b) => b[1] - a[1])[0];
-  const channelConcentration = topChannel && channelTotal
-    ? { name: topChannel[0], pct: money((topChannel[1] / channelTotal) * 100) }
-    : null;
-
+  // Product/customer/channel concentration are computed separately per period
+  // (This Month / Last Month / Last 90 Days) in compute() — see
+  // concentrationByPeriod, merged in by the caller — since a concentration
+  // figure only means something read against a specific window.
   return {
     monthlyTrend,
     growth: {
       last30Sales: money(last30), prev30Sales: money(prev30),
       changePct: prev30 ? money(((last30 - prev30) / prev30) * 100) : null,
     },
-    top5ProfitPct: totalProfit90 ? money((top5Profit / totalProfit90) * 100) : 0,
     deadStockPct: endingInventoryRetailValue ? money((deadStockValue / endingInventoryRetailValue) * 100) : 0,
     stockOutRevenueAtRisk: money(stockOutRevenueAtRisk),
-    customerConcentrationPct: customerSegments.top5RevenuePct,
     atRiskValue: money(atRiskValue),
     atRiskCount: customerSegments.atRisk.length,
-    channelConcentration,
   };
 }
 
@@ -742,21 +805,26 @@ async function generateStrategicAnalysis(context) {
       model: "claude-opus-4-8",
       max_tokens: 1536,
       thinking: { type: "adaptive" },
-      system: `You are a Chief Financial Officer/strategic advisor for Gearevo, a knife/gear retailer in Malaysia selling through Shopify, Shopee, and TikTok Shop.
+      system: `You are the Managing Director of Gearevo, a knife/gear retailer in Malaysia selling through Shopify, Shopee, and TikTok Shop. You are reviewing this snapshot to decide what to do next — not to describe the numbers, but to act on them.
 
-Your task: based on the data below, write a strategic analysis to help the director make decisions about business SUSTAINABILITY — not day-to-day tasks, but medium-term direction (next month/quarter).
+Think in two tiers, and make the tier explicit in what you write:
+1. DECIDE NOW — real-time/point-in-time facts that describe the business's current state and may need action this week (out-of-stock revenue exposure, dead stock capital, at-risk customer value). These aren't trends, they're the situation as of today.
+2. WATCH OR ACT ON TREND — anything given across multiple periods (concentrationByPeriod has thisMonth/lastMonth/last90d for product, customer, and channel concentration; monthlyTrend has multiple months of sales/margin/orders). For these, EXPLICITLY compare periods before concluding anything:
+   - If a concentration figure is high this month but was normal last month and over the 90-day baseline, call it a one-off (e.g. a single bulk order or a promo), not a structural risk — don't recommend restructuring the business over a single-month blip.
+   - If it's consistently high across this month, last month, AND the 90-day window, call it a real structural dependency and treat it as higher priority than a one-off.
+   - If growth or margin is moving consistently in one direction across the months given, say so plainly (growing/stagnant/declining) rather than hedging.
 
-Write 4-7 strategic observations in plain business English, each 1-3 sentences, covering (where relevant to the data):
-- Overall verdict: does the sales/margin trend show the business growing, stagnant, or declining.
-- Concentration risk: dependence on specific products/customers/channels that could be dangerous if they fail.
-- Capital efficiency: how much money is tied up in dead stock vs. the risk of lost sales from being out of stock.
-- Customer health: is the customer base growing (new customers) or shrinking (at-risk customers).
-- 2-3 concrete strategic actions the director could take this month.
+Write 5-8 observations in plain business English, each 1-3 sentences. Cover, where the data supports it:
+- Overall trajectory verdict (growing/stagnant/declining) from monthlyTrend.
+- Which concentration risks (product/customer/channel) are one-off vs structural, per the period-comparison rule above.
+- Capital efficiency: dead stock tied-up capital vs. revenue exposure from being out of stock — which is the bigger problem right now.
+- Customer base health: new customers vs. at-risk value, and whether the lifetime customer concentration figure suggests a different risk profile than the short-term ones.
+- 2-3 concrete, specific actions to take THIS MONTH, each tied to a specific number from the data (not generic advice like "monitor closely").
 
 Strict rules:
-- Only use the numbers given. DO NOT invent figures, trends, or product names that aren't in the data.
-- Be honest if the data shows risk — don't be overly positive if the numbers don't support it.
-- Don't repeat the same sentence format as the daily report ("Recommendations") — this should feel more strategic/executive.`,
+- Only use the numbers given. DO NOT invent figures, trends, or product/customer names that aren't in the data.
+- Be honest if the data shows risk — don't be overly positive if the numbers don't support it. Equally, don't manufacture urgency out of a single noisy data point.
+- Don't repeat the same sentence format as the daily tactical report ("Recommendations") — this should read like an executive is deciding, not a dashboard summarizing.`,
       messages: [{
         role: "user",
         content: `Gearevo business analysis data (snapshot ${context.date}):\n\n${JSON.stringify(context, null, 2)}`,
@@ -858,7 +926,7 @@ async function sendEmail(m, yesterday) {
 async function runFull() {
   const raw = await pull();
   const metrics = compute(raw);
-  const { dailyTrend, monthlyOrderTrend, ...latest } = metrics;
+  const { dailyTrend, monthlyOrderTrend, concentrationByPeriod, ...latest } = metrics;
 
   const customers = await pullCustomers();
   latest.customerSegments = computeCustomerSegments(customers);
@@ -906,22 +974,24 @@ async function runFull() {
   if (aiInsights) latest.insights = aiInsights;
 
   latest.businessAnalysis = computeBusinessAnalysis({
-    dailyTrend, monthlyOrderTrend, totalProfit90: latest.totalProfit90, topProducts: latest.topProducts,
-    deadStock: latest.deadStock, stockOut: latest.stockOut, customerSegments: latest.customerSegments,
-    endingInventoryRetailValue: latest.endingInventoryRetailValue, byChannel: latest.byChannel,
+    dailyTrend, monthlyOrderTrend, deadStock: latest.deadStock, stockOut: latest.stockOut,
+    customerSegments: latest.customerSegments, endingInventoryRetailValue: latest.endingInventoryRetailValue,
   });
+  latest.businessAnalysis.concentrationByPeriod = concentrationByPeriod;
+
   const strategicAnalysis = await generateStrategicAnalysis({
     date: latest.date,
     growth: latest.businessAnalysis.growth,
     monthlyTrend: latest.businessAnalysis.monthlyTrend,
     margin: latest.mtd.margin,
-    top5ProfitPct: latest.businessAnalysis.top5ProfitPct,
+    // All three periods, so Claude can distinguish a one-off this month from
+    // a persistent 90-day pattern — see concentrationByPeriod's own comment.
+    concentrationByPeriod,
+    lifetimeCustomerConcentrationPct: latest.customerSegments.top5RevenuePct,
     deadStockPct: latest.businessAnalysis.deadStockPct,
     stockOutRevenueAtRisk: latest.businessAnalysis.stockOutRevenueAtRisk,
-    customerConcentrationPct: latest.businessAnalysis.customerConcentrationPct,
     atRiskValue: latest.businessAnalysis.atRiskValue,
     atRiskCount: latest.businessAnalysis.atRiskCount,
-    channelConcentration: latest.businessAnalysis.channelConcentration,
     newThisMonth: latest.customerSegments.newThisMonth,
     totalCustomers: latest.customerSegments.totalCustomers,
     endingInventoryRetailValue: latest.endingInventoryRetailValue,
