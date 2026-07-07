@@ -445,10 +445,13 @@ function compute({ variantMap, orders }) {
     // on-hand via oversold / "continue selling when out of stock") is a
     // distinct, more urgent state than "running low" — it's not a forecast,
     // it's a fact, and it deserves its own list rather than a nonsensical
-    // "-70 hari lagi" row in the forecasting table. Tracked + non-excluded
-    // only, same scope as the inventory-value calc, so untracked/service
-    // variants (which always read 0 but aren't real stock) don't flood it.
-    if (v.tracked && v.inventory <= 0 && !isInventoryExcludedTitle(v.productTitle)) {
+    // "-70 hari lagi" row in the forecasting table. Deliberately NOT gated on
+    // v.tracked — some real physical SKUs (e.g. consumables like Camellia
+    // Oil) have inventory tracking disabled in Shopify yet still carry a
+    // meaningful on-hand count the owner wants to see. Only known non-stock
+    // titles (services, kydex, etc.) are excluded, same scope as the
+    // inventory-value calc.
+    if (v.inventory <= 0 && !isInventoryExcludedTitle(v.productTitle)) {
       const targetStock = velocity > 0 ? Math.ceil(velocity * (REORDER_LEAD_DAYS + REORDER_BUFFER_DAYS)) : 0;
       stockOut.push({
         title: v.productTitle, sku: v.sku, onHand: v.inventory, sold30,
@@ -495,7 +498,7 @@ function compute({ variantMap, orders }) {
     returnsRate: money(returnsRate),
     topProducts, topProductsMTD, // topProducts = full 90-day window (dashboard default); MTD = email only
     deadStock: deadStock.slice(0, 20), stockAlerts: stockAlerts.slice(0, 20),
-    stockOut: stockOut.slice(0, 30),
+    stockOut, // unsliced — dashboard shows first 20 with a "see more" toggle for the rest
     byRegion, byChannel, // both scoped to this month (MTD) — same window as mtd.sales
     ...computeInventory(variantMap),
     dailyTrend,
