@@ -497,8 +497,8 @@ function compute({ variantMap, orders }) {
     },
     returnsRate: money(returnsRate),
     topProducts, topProductsMTD, // topProducts = full 90-day window (dashboard default); MTD = email only
-    deadStock: deadStock.slice(0, 20), stockAlerts: stockAlerts.slice(0, 20),
-    stockOut, // unsliced — dashboard shows first 20 with a "see more" toggle for the rest
+    deadStock, stockAlerts: stockAlerts.slice(0, 20),
+    stockOut, // deadStock/stockOut unsliced — dashboard shows first 20 with a "see more" toggle for the rest
     byRegion, byChannel, // both scoped to this month (MTD) — same window as mtd.sales
     ...computeInventory(variantMap),
     dailyTrend,
