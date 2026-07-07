@@ -233,6 +233,9 @@ async function pull() {
 
 // ---------- compute ----------
 function money(n) { return Math.round(n * 100) / 100; }
+// Always exactly 2 decimal places (RM45.60, not RM46) — used everywhere a
+// ringgit figure is rendered into insight text or the email body.
+function rm(n) { return `RM${Number(n || 0).toLocaleString("en-MY", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`; }
 
 // Ending inventory retail value = on-hand qty × price, tracked, non-excluded-
 // title variants only — mirrors the ShopifyQL report verbatim (see
@@ -578,7 +581,7 @@ function computeQuickToday({ created, updated }) {
 function buildInsights({ mtdSales, margin, deadStock, stockAlerts, stockOut, target }) {
   const out = [];
   const pace = (mtdSales / target) * 100;
-  if (pace < 70) out.push(`Sales this month are only ${pace.toFixed(0)}% of the RM${target.toLocaleString()} target. Needs a push.`);
+  if (pace < 70) out.push(`Sales this month are only ${pace.toFixed(0)}% of the ${rm(target)} target. Needs a push.`);
   else if (pace >= 100) out.push(`Monthly target reached (${pace.toFixed(0)}%). Great work!`);
   if (margin < 40) out.push(`Margin at ${margin.toFixed(1)}% is low — check discounts or costs.`);
   if (stockOut?.length) {
@@ -595,7 +598,7 @@ function buildInsights({ mtdSales, margin, deadStock, stockAlerts, stockOut, tar
   }
   if (deadStock.length) {
     const tied = deadStock.reduce((s, d) => s + d.capital, 0);
-    out.push(`RM${Math.round(tied).toLocaleString()} of capital is tied up in ${deadStock.length} slow-moving SKUs — consider clearance.`);
+    out.push(`${rm(tied)} of capital is tied up in ${deadStock.length} slow-moving SKUs — consider clearance.`);
   }
   return out;
 }
@@ -788,11 +791,6 @@ async function sendEmail(m, yesterday) {
   const { EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, EMAILJS_PUBLIC_KEY, EMAILJS_PRIVATE_KEY, REPORT_TO } = process.env;
   if (!EMAILJS_SERVICE_ID || !REPORT_TO) { console.log("Email skipped (not configured)."); return; }
 
-  // rm() matches the dashboard's own number formatting (thousand separators) —
-  // the plain concatenation here previously produced "RM2717" next to
-  // "RM104,884" from buildInsights(), an inconsistency that made the email
-  // harder to scan.
-  const rm = (n) => `RM${Number(n || 0).toLocaleString("en-MY", { maximumFractionDigits: 2 })}`;
   const topMTD = m.topProductsMTD?.[0] || m.topProducts?.[0]; // fall back for older cached metrics
   const changeStr = yesterday.changePct == null ? "" :
     ` (${yesterday.changePct >= 0 ? "↑" : "↓"}${Math.abs(yesterday.changePct).toFixed(0)}%)`;
