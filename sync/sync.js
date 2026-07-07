@@ -114,7 +114,7 @@ const Q_ORDERS = `
     orders(first: 50, after: $cursor, query: $q, sortKey: CREATED_AT) {
       pageInfo { hasNextPage endCursor }
       nodes {
-        id createdAt displayFinancialStatus
+        id createdAt displayFinancialStatus cancelledAt
         totalPriceSet { shopMoney { amount } }
         subtotalPriceSet { shopMoney { amount } }
         totalRefundedSet { shopMoney { amount } }
@@ -308,8 +308,15 @@ function compute({ variantMap, orders }) {
 
   let todaySubtotal = 0, todayOrders = 0, todayRefunds = 0;
   let mtdSubtotal = 0, mtdOrders = 0, mtdCost = 0, mtdRefunds = 0;
-  let refundTotal = 0, grossTotal = 0;
+  let mtdGrossTotal = 0, mtdRefundTotalOnOrder = 0;
+  let refundTotal = 0, grossTotal = 0, cancelledOrders = 0;
   const byRegion = {}, byChannel = {}; // scoped to this month (MTD) — see targetPct-style window below
+  // Per-order-month counts (orders/returns/cancellations) across the whole
+  // 90-day pull, not just the current month — this seeds up to ~3 months of
+  // real history for the Business Analysis trend chart immediately, and gets
+  // persisted to Firestore's monthly/{month} collection each full sync so
+  // months keep their final numbers after they age out of the 90-day window.
+  const monthlyOrderStats = {};
   const soldUnits7 = {}, soldUnits30 = {}, soldUnits90 = {};
   const profitByProduct = {};    // full 90-day window — dashboard's default "All" view
   const profitByProductMTD = {}; // this month only — used by the email report
@@ -326,12 +333,21 @@ function compute({ variantMap, orders }) {
     const ageDays = (now - created) / 864e5;
     grossTotal += total;
     refundTotal += num(o.totalRefundedSet?.shopMoney?.amount);
+    if (o.cancelledAt) cancelledOrders++;
+
+    const mstat = monthlyOrderStats[createdMonthKey] || (monthlyOrderStats[createdMonthKey] =
+      { month: createdMonthKey, orders: 0, returnOrders: 0, cancelledOrders: 0 });
+    mstat.orders++;
+    if (o.cancelledAt) mstat.cancelledOrders++;
+    if ((o.refunds || []).length > 0) mstat.returnOrders++; // "return order" = had at least one refund event, of any kind/reason
 
     if (createdMonthKey === monthKey) {
       const prov = o.shippingAddress?.province || "Unknown";
       byRegion[prov] = (byRegion[prov] || 0) + total;
-      const ch = o.channelInformation?.channelDefinition?.channelName || "Lain-lain";
+      const ch = o.channelInformation?.channelDefinition?.channelName || "Other";
       byChannel[ch] = (byChannel[ch] || 0) + total;
+      mtdGrossTotal += total;
+      mtdRefundTotalOnOrder += num(o.totalRefundedSet?.shopMoney?.amount);
     }
 
     // Sales: every order placed in the window counts on its ORDER date, incl. later-cancelled
@@ -416,7 +432,15 @@ function compute({ variantMap, orders }) {
 
   const grossProfit = mtdSales - mtdCost;
   const margin = mtdSales ? (grossProfit / mtdSales) * 100 : 0;
-  const returnsRate = grossTotal ? (refundTotal / grossTotal) * 100 : 0;
+  const returnsRate = grossTotal ? (refundTotal / grossTotal) * 100 : 0; // 90-day, value-based — kept for AI context
+
+  // This month's return/cancellation stats, order-count based (not $ value) —
+  // "3 of 205 orders" is the comparison a director actually reads, not a bare "3".
+  const currentMonthOrderStats = monthlyOrderStats[monthKey] || { orders: 0, returnOrders: 0, cancelledOrders: 0 };
+  const mtdReturnsRate = mtdGrossTotal ? (mtdRefundTotalOnOrder / mtdGrossTotal) * 100 : 0;
+  const mtdCancelledRate = currentMonthOrderStats.orders
+    ? (currentMonthOrderStats.cancelledOrders / currentMonthOrderStats.orders) * 100 : 0;
+  const monthlyOrderTrend = Object.values(monthlyOrderStats).sort((a, b) => a.month.localeCompare(b.month));
 
   const rankProducts = (byProduct) => Object.values(byProduct)
     .sort((a, b) => b.profit - a.profit).slice(0, 20)
@@ -499,14 +523,18 @@ function compute({ variantMap, orders }) {
       aov: mtdOrders ? money(mtdSales / mtdOrders) : 0,
       target: TARGET, targetPct: money((mtdSales / TARGET) * 100),
       grossProfit: money(grossProfit), margin: money(margin),
+      // Order-count based, not $-value based — "N of M orders" is the
+      // comparison a director actually reads, not a bare count.
+      returnsRate: money(mtdReturnsRate), returnOrders: currentMonthOrderStats.returnOrders,
+      cancelledOrders: currentMonthOrderStats.cancelledOrders, cancelledRate: money(mtdCancelledRate),
     },
-    returnsRate: money(returnsRate),
+    returnsRate: money(returnsRate), cancelledOrders, // 90-day, kept for the AI insights context only
     topProducts, topProductsMTD, totalProfit90: money(totalProfit90), // topProducts = full 90-day window (dashboard default); MTD = email only
     deadStock, stockAlerts: stockAlerts.slice(0, 20),
     stockOut, // deadStock/stockOut unsliced — dashboard shows first 20 with a "see more" toggle for the rest
     byRegion, byChannel, // both scoped to this month (MTD) — same window as mtd.sales
     ...computeInventory(variantMap),
-    dailyTrend,
+    dailyTrend, monthlyOrderTrend, // both destructured back out in runFull() — not written to dashboard/latest directly
     insights: buildInsights({ mtdSales, margin, deadStock, stockAlerts, stockOut, target: TARGET }),
   };
 }
@@ -577,7 +605,7 @@ function buildInsights({ mtdSales, margin, deadStock, stockAlerts, stockOut, tar
 // into a single "can this business sustain itself" snapshot — distinct from
 // the daily tactical Recommendations insights above. Full-sync only (needs
 // customerSegments, which requires the separate customer pull).
-function computeBusinessAnalysis({ dailyTrend, totalProfit90, topProducts, deadStock, stockOut,
+function computeBusinessAnalysis({ dailyTrend, monthlyOrderTrend, totalProfit90, topProducts, deadStock, stockOut,
   customerSegments, endingInventoryRetailValue, byChannel }) {
   // Monthly trend: bucket the (up to 90-day) daily trend by calendar month.
   // Edge months are necessarily partial (whatever's inside the 90-day pull
@@ -590,10 +618,18 @@ function computeBusinessAnalysis({ dailyTrend, totalProfit90, topProducts, deadS
     bucket.orders += d.orders;
     for (const p of d.products || []) { bucket.profit += p.profit; bucket.revenue += p.revenue; }
   }
-  const monthlyTrend = Object.values(monthly).sort((a, b) => a.month.localeCompare(b.month)).map((m) => ({
-    month: m.month, sales: money(m.sales), orders: m.orders,
-    margin: m.revenue ? money((m.profit / m.revenue) * 100) : 0,
-  }));
+  // returnOrders/cancelledOrders come from the raw per-order pull (monthlyOrderTrend),
+  // not the daily-aggregated rows above, since refund/cancellation status isn't
+  // part of the per-day dashboard trend doc.
+  const monthlyTrend = Object.values(monthly).sort((a, b) => a.month.localeCompare(b.month)).map((m) => {
+    const orderStats = (monthlyOrderTrend || []).find((o) => o.month === m.month) || {};
+    return {
+      month: m.month, sales: money(m.sales), orders: m.orders,
+      margin: m.revenue ? money((m.profit / m.revenue) * 100) : 0,
+      returnOrders: orderStats.returnOrders || 0,
+      cancelledOrders: orderStats.cancelledOrders || 0,
+    };
+  });
 
   // Growth: rolling last-30-vs-prior-30 days (not calendar months), so it's
   // meaningful regardless of where in the month the sync happens to run.
@@ -824,18 +860,18 @@ async function sendEmail(m, yesterday) {
 async function runFull() {
   const raw = await pull();
   const metrics = compute(raw);
-  const { dailyTrend, ...latest } = metrics;
+  const { dailyTrend, monthlyOrderTrend, ...latest } = metrics;
 
   const customers = await pullCustomers();
   latest.customerSegments = computeCustomerSegments(customers);
   if (latest.customerSegments.newThisMonth > 0) {
-    latest.insights.push(`${latest.customerSegments.newThisMonth} pelanggan baru bulan ini.`);
+    latest.insights.push(`${latest.customerSegments.newThisMonth} new customers this month.`);
   }
   if (latest.customerSegments.top5RevenuePct > 0) {
-    latest.insights.push(`${latest.customerSegments.top5RevenuePct}% jualan sepanjang masa datang daripada 5% pelanggan teratas.`);
+    latest.insights.push(`${latest.customerSegments.top5RevenuePct}% of all-time sales come from the top 5% of customers.`);
   }
   if (latest.customerSegments.atRisk.length > 0) {
-    latest.insights.push(`${latest.customerSegments.atRisk.length} pelanggan berulang tiada order >6 bulan — pertimbang hubungi semula.`);
+    latest.insights.push(`${latest.customerSegments.atRisk.length} repeat customers haven't ordered in >6 months — consider reaching out.`);
   }
 
   const last7 = dailyTrend.slice(-7).reduce((s, d) => s + d.todaySales, 0);
@@ -872,7 +908,7 @@ async function runFull() {
   if (aiInsights) latest.insights = aiInsights;
 
   latest.businessAnalysis = computeBusinessAnalysis({
-    dailyTrend, totalProfit90: latest.totalProfit90, topProducts: latest.topProducts,
+    dailyTrend, monthlyOrderTrend, totalProfit90: latest.totalProfit90, topProducts: latest.topProducts,
     deadStock: latest.deadStock, stockOut: latest.stockOut, customerSegments: latest.customerSegments,
     endingInventoryRetailValue: latest.endingInventoryRetailValue, byChannel: latest.byChannel,
   });
@@ -899,9 +935,16 @@ async function runFull() {
   for (const day of dailyTrend) {
     batch.set(db.doc(`daily/${day.date}`), day);
   }
+  // Persisted separately from dashboard/latest (which only holds whatever's in
+  // the current 90-day pull) so a month keeps its final orders/returns/
+  // cancellations numbers permanently, even after it ages out of that window —
+  // this is what lets later months compare against it.
+  for (const monthRow of latest.businessAnalysis.monthlyTrend) {
+    batch.set(db.doc(`monthly/${monthRow.month}`), monthRow, { merge: true });
+  }
   batch.set(db.doc("sync/state"), { lastFullSyncDate: metrics.date, lastFullSyncAt: metrics.generatedAt });
   await batch.commit();
-  console.log(`Full sync — dashboard/latest + ${dailyTrend.length} daily docs.`);
+  console.log(`Full sync — dashboard/latest + ${dailyTrend.length} daily docs + ${latest.businessAnalysis.monthlyTrend.length} monthly docs.`);
   return metrics;
 }
 
