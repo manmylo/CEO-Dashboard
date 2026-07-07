@@ -211,7 +211,7 @@ async function pullProducts() {
 async function pullCustomers() {
   const customers = await paginate(Q_CUSTOMERS, (d) => d.customers);
   return customers.map((c) => ({
-    name: c.displayName || "Pelanggan",
+    name: c.displayName || "Customer",
     email: c.email || "",
     createdAt: c.createdAt,
     orders: Number(c.numberOfOrders || 0),
@@ -449,7 +449,7 @@ function compute({ variantMap, orders }) {
     // on-hand via oversold / "continue selling when out of stock") is a
     // distinct, more urgent state than "running low" — it's not a forecast,
     // it's a fact, and it deserves its own list rather than a nonsensical
-    // "-70 hari lagi" row in the forecasting table. Deliberately NOT gated on
+    // "-70 days left" row in the forecasting table. Deliberately NOT gated on
     // v.tracked — some real physical SKUs (e.g. consumables like Camellia
     // Oil) have inventory tracking disabled in Shopify yet still carry a
     // meaningful on-hand count the owner wants to see. Only known non-stock
@@ -550,24 +550,24 @@ function computeQuickToday({ created, updated }) {
 function buildInsights({ mtdSales, margin, deadStock, stockAlerts, stockOut, target }) {
   const out = [];
   const pace = (mtdSales / target) * 100;
-  if (pace < 70) out.push(`Jualan bulan ini baru ${pace.toFixed(0)}% dari sasaran RM${target.toLocaleString()}. Perlu push.`);
-  else if (pace >= 100) out.push(`Sasaran bulanan dah tercapai (${pace.toFixed(0)}%). Bagus!`);
-  if (margin < 40) out.push(`Margin ${margin.toFixed(1)}% rendah — semak diskaun atau kos.`);
+  if (pace < 70) out.push(`Sales this month are only ${pace.toFixed(0)}% of the RM${target.toLocaleString()} target. Needs a push.`);
+  else if (pace >= 100) out.push(`Monthly target reached (${pace.toFixed(0)}%). Great work!`);
+  if (margin < 40) out.push(`Margin at ${margin.toFixed(1)}% is low — check discounts or costs.`);
   if (stockOut?.length) {
     const withDemand = stockOut.filter((s) => s.sold30 > 0).length;
     out.push(withDemand
-      ? `${stockOut.length} SKU dah habis stok (${withDemand} ada jualan dalam 30 hari lepas) — reorder segera.`
-      : `${stockOut.length} SKU dah habis stok — semak sama ada perlu reorder atau discontinue.`);
+      ? `${stockOut.length} SKUs are out of stock (${withDemand} had sales in the last 30 days) — reorder urgently.`
+      : `${stockOut.length} SKUs are out of stock — check whether to reorder or discontinue.`);
   }
   if (stockAlerts.length) {
     const critical = stockAlerts.filter((a) => a.urgency === "critical").length;
     out.push(critical
-      ? `${stockAlerts.length} SKU akan habis stok dalam ${LOW_STOCK_DAYS} hari (${critical} kritikal, ≤${CRITICAL_STOCK_DAYS} hari) — buat pesanan.`
-      : `${stockAlerts.length} SKU akan habis stok dalam ${LOW_STOCK_DAYS} hari — buat pesanan.`);
+      ? `${stockAlerts.length} SKUs will run out within ${LOW_STOCK_DAYS} days (${critical} critical, ≤${CRITICAL_STOCK_DAYS} days) — place an order.`
+      : `${stockAlerts.length} SKUs will run out within ${LOW_STOCK_DAYS} days — place an order.`);
   }
   if (deadStock.length) {
     const tied = deadStock.reduce((s, d) => s + d.capital, 0);
-    out.push(`RM${Math.round(tied).toLocaleString()} modal tidur dalam ${deadStock.length} SKU slow-moving — pertimbang clearance.`);
+    out.push(`RM${Math.round(tied).toLocaleString()} of capital is tied up in ${deadStock.length} slow-moving SKUs — consider clearance.`);
   }
   return out;
 }
@@ -575,7 +575,7 @@ function buildInsights({ mtdSales, margin, deadStock, stockAlerts, stockOut, tar
 // ---------- business analysis (director-level sustainability view) ----------
 // Synthesizes trend/concentration signals from data already computed elsewhere
 // into a single "can this business sustain itself" snapshot — distinct from
-// the daily tactical Cadangan insights above. Full-sync only (needs
+// the daily tactical Recommendations insights above. Full-sync only (needs
 // customerSegments, which requires the separate customer pull).
 function computeBusinessAnalysis({ dailyTrend, totalProfit90, topProducts, deadStock, stockOut,
   customerSegments, endingInventoryRetailValue, byChannel }) {
@@ -635,8 +635,8 @@ function computeBusinessAnalysis({ dailyTrend, totalProfit90, topProducts, deadS
 
 // ---------- AI-generated advisor commentary (Claude) ----------
 // Replaces the rule-based buildInsights() output above when available, using
-// the exact same array-of-strings shape so the dashboard's Penasihat panel
-// and the email's Cadangan section need no changes either way. Falls back to
+// the exact same array-of-strings shape so the dashboard's Advisor panel
+// and the email's Recommendations section need no changes either way. Falls back to
 // the rule-based insights (already computed) if the key isn't configured or
 // the call fails — the sync never breaks because of an AI outage.
 async function generateAIInsights(context) {
@@ -651,18 +651,18 @@ async function generateAIInsights(context) {
       model: "claude-opus-4-8",
       max_tokens: 1024,
       thinking: { type: "adaptive" },
-      system: `Anda seorang penasihat perniagaan (Chief Data Officer) untuk Gearevo, kedai pisau/gear di Malaysia yang berjualan melalui Shopify, Shopee, dan TikTok Shop.
+      system: `You are a business advisor (Chief Data Officer) for Gearevo, a knife/gear retailer in Malaysia selling through Shopify, Shopee, and TikTok Shop.
 
-Tulis 3-6 pemerhatian ringkas dalam Bahasa Melayu perniagaan, gaya sama seperti: "Jualan bulan ini baru 45% dari sasaran RM120,000. Perlu push."
+Write 3-6 concise observations in plain business English, in the same style as: "Sales this month are only 45% of the RM120,000 target. Needs a push."
 
-Peraturan ketat:
-- Hanya guna nombor yang diberikan di bawah. JANGAN cipta angka, trend, atau nama produk yang tiada dalam data.
-- Jangan paksa buat pemerhatian untuk metrik yang tiada isu — utamakan yang paling penting dan actionable dahulu.
-- Setiap ayat pendek (1-2 ayat), sertakan cadangan tindakan jika berkaitan.
-- Sebut juga jika ada sesuatu yang positif, bukan sekadar masalah.`,
+Strict rules:
+- Only use the numbers given below. DO NOT invent figures, trends, or product names that aren't in the data.
+- Don't force an observation for a metric that has no issue — prioritize the most important and actionable points first.
+- Keep each sentence short (1-2 sentences), including a suggested action where relevant.
+- Also mention something positive if there is one, not just problems.`,
       messages: [{
         role: "user",
-        content: `Data perniagaan Gearevo untuk ${context.date}:\n\n${JSON.stringify(context, null, 2)}`,
+        content: `Gearevo business data for ${context.date}:\n\n${JSON.stringify(context, null, 2)}`,
       }],
       output_config: {
         format: {
@@ -687,7 +687,7 @@ Peraturan ketat:
   }
 }
 
-// Director-level strategic narrative for the "Analisis Perniagaan" tab —
+// Director-level strategic narrative for the "Business Analysis" tab —
 // deliberately a separate call/prompt from generateAIInsights above: that one
 // is daily/tactical ("what to do today"), this one is sustainability-focused
 // ("is the business on a path that survives"). No rule-based fallback exists
@@ -703,24 +703,24 @@ async function generateStrategicAnalysis(context) {
       model: "claude-opus-4-8",
       max_tokens: 1536,
       thinking: { type: "adaptive" },
-      system: `Anda seorang Chief Financial Officer/penasihat strategik untuk Gearevo, kedai pisau/gear di Malaysia yang berjualan melalui Shopify, Shopee, dan TikTok Shop.
+      system: `You are a Chief Financial Officer/strategic advisor for Gearevo, a knife/gear retailer in Malaysia selling through Shopify, Shopee, and TikTok Shop.
 
-Tugas anda: berdasarkan data di bawah, tulis analisis strategik untuk membantu pengarah (director) membuat keputusan tentang KELESTARIAN (sustainability) perniagaan — bukan tugasan harian, tapi arah jangka sederhana (bulan/kuarter depan).
+Your task: based on the data below, write a strategic analysis to help the director make decisions about business SUSTAINABILITY — not day-to-day tasks, but medium-term direction (next month/quarter).
 
-Tulis 4-7 pemerhatian strategik dalam Bahasa Melayu perniagaan, setiap satu 1-3 ayat, merangkumi (jika relevan dengan data):
-- Verdict keseluruhan: adakah trend jualan/margin menunjukkan perniagaan berkembang, stagnan, atau merosot.
-- Risiko kepekatan (concentration risk): pergantungan kepada produk/pelanggan/channel tertentu yang boleh jadi bahaya jika ia gagal.
-- Kecekapan modal: berapa banyak duit terikat dalam stok mati vs risiko kehilangan jualan akibat stok habis.
-- Kesihatan pelanggan: adakah asas pelanggan berkembang (pelanggan baru) atau menyusut (pelanggan berisiko hilang).
-- 2-3 cadangan tindakan strategik konkrit yang boleh diambil pengarah bulan ini.
+Write 4-7 strategic observations in plain business English, each 1-3 sentences, covering (where relevant to the data):
+- Overall verdict: does the sales/margin trend show the business growing, stagnant, or declining.
+- Concentration risk: dependence on specific products/customers/channels that could be dangerous if they fail.
+- Capital efficiency: how much money is tied up in dead stock vs. the risk of lost sales from being out of stock.
+- Customer health: is the customer base growing (new customers) or shrinking (at-risk customers).
+- 2-3 concrete strategic actions the director could take this month.
 
-Peraturan ketat:
-- Hanya guna nombor yang diberikan. JANGAN cipta angka, trend, atau nama produk yang tiada dalam data.
-- Jujur jika data menunjukkan risiko — jangan over-positive jika angka tak menyokong.
-- Jangan ulang format ayat yang sama seperti laporan harian ("Cadangan") — ini perlu terasa lebih strategik/executive.`,
+Strict rules:
+- Only use the numbers given. DO NOT invent figures, trends, or product names that aren't in the data.
+- Be honest if the data shows risk — don't be overly positive if the numbers don't support it.
+- Don't repeat the same sentence format as the daily report ("Recommendations") — this should feel more strategic/executive.`,
       messages: [{
         role: "user",
-        content: `Data analisis perniagaan Gearevo (snapshot ${context.date}):\n\n${JSON.stringify(context, null, 2)}`,
+        content: `Gearevo business analysis data (snapshot ${context.date}):\n\n${JSON.stringify(context, null, 2)}`,
       }],
       output_config: {
         format: {
@@ -769,33 +769,33 @@ async function sendEmail(m, yesterday) {
   const lines = [
     `Good morning Boss.`,
     ``,
-    `📊 JUALAN`,
-    `Semalam (${yesterday.date}): ${rm(yesterday.todaySales)}${changeStr} — ${yesterday.orders} order`,
-    `Bulan ini: ${rm(m.mtd.sales)} / ${rm(m.mtd.target)} (${m.mtd.targetPct}%)`,
+    `📊 SALES`,
+    `Yesterday (${yesterday.date}): ${rm(yesterday.todaySales)}${changeStr} — ${yesterday.orders} orders`,
+    `This month: ${rm(m.mtd.sales)} / ${rm(m.mtd.target)} (${m.mtd.targetPct}%)`,
     ``,
-    `💰 UNTUNG`,
-    `Margin: ${m.mtd.margin}%   Untung Kasar: ${rm(m.mtd.grossProfit)}`,
-    `AOV: ${rm(m.mtd.aov)}   Pulangan: ${m.returnsRate}%`,
+    `💰 PROFIT`,
+    `Margin: ${m.mtd.margin}%   Gross Profit: ${rm(m.mtd.grossProfit)}`,
+    `AOV: ${rm(m.mtd.aov)}   Returns: ${m.returnsRate}%`,
     ``,
-    `🏆 PRODUK`,
-    `Top produk (bulan ini): ${topMTD?.title || "-"} — ${rm(topMTD?.profit || 0)} untung`,
+    `🏆 PRODUCTS`,
+    `Top product (this month): ${topMTD?.title || "-"} — ${rm(topMTD?.profit || 0)} profit`,
     (m.stockAlerts.length || m.stockOut?.length) ? `` : null,
-    (m.stockAlerts.length || m.stockOut?.length) ? `⚠️ STOK` : null,
+    (m.stockAlerts.length || m.stockOut?.length) ? `⚠️ STOCK` : null,
     m.stockOut?.length ? (() => {
       const withDemand = m.stockOut.filter((s) => s.sold30 > 0).length;
       const worst = m.stockOut[0]; // pre-sorted by sold30 descending
-      const demandStr = withDemand ? ` (${withDemand} ada jualan dlm 30 hari)` : "";
-      return `Dah habis stok: ${m.stockOut.length} SKU${demandStr} — paling laku: ${worst.title} (${worst.sold30} unit/30hr, cadang pesan ${worst.reorderQty} unit)`;
+      const demandStr = withDemand ? ` (${withDemand} with sales in last 30 days)` : "";
+      return `Out of stock: ${m.stockOut.length} SKUs${demandStr} — best seller: ${worst.title} (${worst.sold30} units/30d, suggest ordering ${worst.reorderQty} units)`;
     })() : null,
     m.stockAlerts.length ? (() => {
       const critical = m.stockAlerts.filter((a) => a.urgency === "critical").length;
       const worst = m.stockAlerts[0]; // pre-sorted by daysLeft ascending
-      const tierStr = critical ? `Hampir habis: ${m.stockAlerts.length} SKU (${critical} kritikal)` : `Hampir habis: ${m.stockAlerts.length} SKU`;
-      const daysStr = worst.daysLeft === 0 ? "dah habis" : `${worst.daysLeft} hari lagi`;
-      return `${tierStr} — paling mendesak: ${worst.title} (${daysStr}, habis ~${worst.stockoutDate}, cadang pesan ${worst.reorderQty} unit)`;
+      const tierStr = critical ? `Low stock: ${m.stockAlerts.length} SKUs (${critical} critical)` : `Low stock: ${m.stockAlerts.length} SKUs`;
+      const daysStr = worst.daysLeft === 0 ? "already out" : `${worst.daysLeft} days left`;
+      return `${tierStr} — most urgent: ${worst.title} (${daysStr}, runs out ~${worst.stockoutDate}, suggest ordering ${worst.reorderQty} units)`;
     })() : null,
     ``,
-    `📋 CADANGAN`,
+    `📋 RECOMMENDATIONS`,
     ...m.insights.map((i) => `• ${i}`),
   ];
   const body = lines.filter((line) => line !== null).join("\n");
