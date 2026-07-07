@@ -426,6 +426,10 @@ function compute({ variantMap, orders }) {
     }));
   const topProducts = rankProducts(profitByProduct);
   const topProductsMTD = rankProducts(profitByProductMTD);
+  // Full (untruncated) 90-day profit total — topProducts above is capped at
+  // 20, so concentration ratios (e.g. "top 5 = X% of profit") must divide by
+  // this, not by summing the already-capped array.
+  const totalProfit90 = Object.values(profitByProduct).reduce((s, p) => s + p.profit, 0);
 
   const deadStock = [], stockAlerts = [], stockOut = [];
   for (const [vid, v] of variantMap) {
@@ -456,6 +460,7 @@ function compute({ variantMap, orders }) {
       stockOut.push({
         title: v.productTitle, sku: v.sku, onHand: v.inventory, sold30,
         reorderQty: Math.max(0, targetStock - v.inventory),
+        price: v.price, // kept for the business-analysis "revenue at risk" estimate; not shown in the table
       });
       continue;
     }
@@ -496,7 +501,7 @@ function compute({ variantMap, orders }) {
       grossProfit: money(grossProfit), margin: money(margin),
     },
     returnsRate: money(returnsRate),
-    topProducts, topProductsMTD, // topProducts = full 90-day window (dashboard default); MTD = email only
+    topProducts, topProductsMTD, totalProfit90: money(totalProfit90), // topProducts = full 90-day window (dashboard default); MTD = email only
     deadStock, stockAlerts: stockAlerts.slice(0, 20),
     stockOut, // deadStock/stockOut unsliced — dashboard shows first 20 with a "see more" toggle for the rest
     byRegion, byChannel, // both scoped to this month (MTD) — same window as mtd.sales
@@ -567,6 +572,67 @@ function buildInsights({ mtdSales, margin, deadStock, stockAlerts, stockOut, tar
   return out;
 }
 
+// ---------- business analysis (director-level sustainability view) ----------
+// Synthesizes trend/concentration signals from data already computed elsewhere
+// into a single "can this business sustain itself" snapshot — distinct from
+// the daily tactical Cadangan insights above. Full-sync only (needs
+// customerSegments, which requires the separate customer pull).
+function computeBusinessAnalysis({ dailyTrend, totalProfit90, topProducts, deadStock, stockOut,
+  customerSegments, endingInventoryRetailValue, byChannel }) {
+  // Monthly trend: bucket the (up to 90-day) daily trend by calendar month.
+  // Edge months are necessarily partial (whatever's inside the 90-day pull
+  // window) — good enough for a direction-of-travel read, not a precise MoM %.
+  const monthly = {};
+  for (const d of dailyTrend) {
+    const mk = d.date.slice(0, 7);
+    const bucket = monthly[mk] || (monthly[mk] = { month: mk, sales: 0, orders: 0, profit: 0, revenue: 0 });
+    bucket.sales += d.todaySales;
+    bucket.orders += d.orders;
+    for (const p of d.products || []) { bucket.profit += p.profit; bucket.revenue += p.revenue; }
+  }
+  const monthlyTrend = Object.values(monthly).sort((a, b) => a.month.localeCompare(b.month)).map((m) => ({
+    month: m.month, sales: money(m.sales), orders: m.orders,
+    margin: m.revenue ? money((m.profit / m.revenue) * 100) : 0,
+  }));
+
+  // Growth: rolling last-30-vs-prior-30 days (not calendar months), so it's
+  // meaningful regardless of where in the month the sync happens to run.
+  const sorted = [...dailyTrend].sort((a, b) => a.date.localeCompare(b.date));
+  const last30 = sorted.slice(-30).reduce((s, d) => s + d.todaySales, 0);
+  const prev30 = sorted.slice(-60, -30).reduce((s, d) => s + d.todaySales, 0);
+
+  const top5Profit = topProducts.slice(0, 5).reduce((s, p) => s + p.profit, 0);
+  const deadStockValue = deadStock.reduce((s, d) => s + d.capital, 0);
+  // Proxy for revenue exposed by items currently unavailable: what their last
+  // 30 days of demand would have been worth at their normal price — not an
+  // exact lost-sales figure (some of that demand may have gone to a
+  // substitute item instead), but a useful order-of-magnitude signal.
+  const stockOutRevenueAtRisk = stockOut.reduce((s, d) => s + d.sold30 * (d.price || 0), 0);
+  const atRiskValue = customerSegments.atRisk.reduce((s, c) => s + c.spent, 0);
+
+  const channelEntries = Object.entries(byChannel || {});
+  const channelTotal = channelEntries.reduce((s, [, v]) => s + v, 0);
+  const topChannel = channelEntries.sort((a, b) => b[1] - a[1])[0];
+  const channelConcentration = topChannel && channelTotal
+    ? { name: topChannel[0], pct: money((topChannel[1] / channelTotal) * 100) }
+    : null;
+
+  return {
+    monthlyTrend,
+    growth: {
+      last30Sales: money(last30), prev30Sales: money(prev30),
+      changePct: prev30 ? money(((last30 - prev30) / prev30) * 100) : null,
+    },
+    top5ProfitPct: totalProfit90 ? money((top5Profit / totalProfit90) * 100) : 0,
+    deadStockPct: endingInventoryRetailValue ? money((deadStockValue / endingInventoryRetailValue) * 100) : 0,
+    stockOutRevenueAtRisk: money(stockOutRevenueAtRisk),
+    customerConcentrationPct: customerSegments.top5RevenuePct,
+    atRiskValue: money(atRiskValue),
+    atRiskCount: customerSegments.atRisk.length,
+    channelConcentration,
+  };
+}
+
 // ---------- AI-generated advisor commentary (Claude) ----------
 // Replaces the rule-based buildInsights() output above when available, using
 // the exact same array-of-strings shape so the dashboard's Penasihat panel
@@ -617,6 +683,64 @@ Peraturan ketat:
     return parsed.insights;
   } catch (e) {
     console.log(`AI insights failed, using rule-based fallback: ${e.message}`);
+    return null;
+  }
+}
+
+// Director-level strategic narrative for the "Analisis Perniagaan" tab —
+// deliberately a separate call/prompt from generateAIInsights above: that one
+// is daily/tactical ("what to do today"), this one is sustainability-focused
+// ("is the business on a path that survives"). No rule-based fallback exists
+// for this one (unlike the daily insights) since it's a new, optional section —
+// if the key isn't configured or the call fails, the tab just omits the
+// narrative and shows the data/charts on their own.
+async function generateStrategicAnalysis(context) {
+  if (!process.env.ANTHROPIC_API_KEY) return null;
+
+  try {
+    const anthropic = new Anthropic();
+    const response = await anthropic.messages.create({
+      model: "claude-opus-4-8",
+      max_tokens: 1536,
+      thinking: { type: "adaptive" },
+      system: `Anda seorang Chief Financial Officer/penasihat strategik untuk Gearevo, kedai pisau/gear di Malaysia yang berjualan melalui Shopify, Shopee, dan TikTok Shop.
+
+Tugas anda: berdasarkan data di bawah, tulis analisis strategik untuk membantu pengarah (director) membuat keputusan tentang KELESTARIAN (sustainability) perniagaan — bukan tugasan harian, tapi arah jangka sederhana (bulan/kuarter depan).
+
+Tulis 4-7 pemerhatian strategik dalam Bahasa Melayu perniagaan, setiap satu 1-3 ayat, merangkumi (jika relevan dengan data):
+- Verdict keseluruhan: adakah trend jualan/margin menunjukkan perniagaan berkembang, stagnan, atau merosot.
+- Risiko kepekatan (concentration risk): pergantungan kepada produk/pelanggan/channel tertentu yang boleh jadi bahaya jika ia gagal.
+- Kecekapan modal: berapa banyak duit terikat dalam stok mati vs risiko kehilangan jualan akibat stok habis.
+- Kesihatan pelanggan: adakah asas pelanggan berkembang (pelanggan baru) atau menyusut (pelanggan berisiko hilang).
+- 2-3 cadangan tindakan strategik konkrit yang boleh diambil pengarah bulan ini.
+
+Peraturan ketat:
+- Hanya guna nombor yang diberikan. JANGAN cipta angka, trend, atau nama produk yang tiada dalam data.
+- Jujur jika data menunjukkan risiko — jangan over-positive jika angka tak menyokong.
+- Jangan ulang format ayat yang sama seperti laporan harian ("Cadangan") — ini perlu terasa lebih strategik/executive.`,
+      messages: [{
+        role: "user",
+        content: `Data analisis perniagaan Gearevo (snapshot ${context.date}):\n\n${JSON.stringify(context, null, 2)}`,
+      }],
+      output_config: {
+        format: {
+          type: "json_schema",
+          schema: {
+            type: "object",
+            properties: { analysis: { type: "array", items: { type: "string" } } },
+            required: ["analysis"],
+            additionalProperties: false,
+          },
+        },
+      },
+    });
+
+    const textBlock = response.content.find((b) => b.type === "text");
+    const parsed = textBlock ? JSON.parse(textBlock.text) : null;
+    if (!parsed || !Array.isArray(parsed.analysis) || !parsed.analysis.length) return null;
+    return parsed.analysis;
+  } catch (e) {
+    console.log(`Strategic analysis failed: ${e.message}`);
     return null;
   }
 }
@@ -746,6 +870,29 @@ async function runFull() {
     endingInventoryRetailValue: latest.endingInventoryRetailValue,
   });
   if (aiInsights) latest.insights = aiInsights;
+
+  latest.businessAnalysis = computeBusinessAnalysis({
+    dailyTrend, totalProfit90: latest.totalProfit90, topProducts: latest.topProducts,
+    deadStock: latest.deadStock, stockOut: latest.stockOut, customerSegments: latest.customerSegments,
+    endingInventoryRetailValue: latest.endingInventoryRetailValue, byChannel: latest.byChannel,
+  });
+  const strategicAnalysis = await generateStrategicAnalysis({
+    date: latest.date,
+    growth: latest.businessAnalysis.growth,
+    monthlyTrend: latest.businessAnalysis.monthlyTrend,
+    margin: latest.mtd.margin,
+    top5ProfitPct: latest.businessAnalysis.top5ProfitPct,
+    deadStockPct: latest.businessAnalysis.deadStockPct,
+    stockOutRevenueAtRisk: latest.businessAnalysis.stockOutRevenueAtRisk,
+    customerConcentrationPct: latest.businessAnalysis.customerConcentrationPct,
+    atRiskValue: latest.businessAnalysis.atRiskValue,
+    atRiskCount: latest.businessAnalysis.atRiskCount,
+    channelConcentration: latest.businessAnalysis.channelConcentration,
+    newThisMonth: latest.customerSegments.newThisMonth,
+    totalCustomers: latest.customerSegments.totalCustomers,
+    endingInventoryRetailValue: latest.endingInventoryRetailValue,
+  });
+  if (strategicAnalysis) latest.businessAnalysis.strategicAnalysis = strategicAnalysis;
 
   const batch = db.batch();
   batch.set(db.doc("dashboard/latest"), latest);
