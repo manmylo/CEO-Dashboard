@@ -35,6 +35,12 @@ const EMAIL_HOUR_MYT = 8;       // send the daily report on the first run at/aft
 const AT_RISK_DAYS = 180;       // repeat customer with no order in this long = at-risk (~6 months)
 const VIP_COUNT = 25;           // top N customers by lifetime spend
 
+// Business is NOT uniform year-round — fed to both AI prompts so seasonal
+// swings aren't misread as "the business is declining" or "over-dependent on
+// one product." Update this note (not code logic) if the seasonal pattern
+// or off-season focus changes.
+const SEASONALITY_CONTEXT = `Gearevo's sales are seasonal, not flat year-round. Butcher knives spike hard around Eid Adha (Hari Raya Haji / Qurban season) and stay elevated for roughly 1-2 months after — a big jump in butcher-knife sales/profit share, or product concentration, during that window is EXPECTED, not a red flag. Outside that window, the business's focus shifts to EDC knives, premium knives, and services — a drop in butcher-knife sales after the season, or those categories being quiet, is normal, not decline. When you see a spike or drop that could be seasonal, say so explicitly rather than treating it as a structural risk or a problem to fix.`;
+
 // Ending inventory retail value only (not margin/dead-stock) — mirrors the
 // ShopifyQL query behind Shopify Analytics' own inventory report:
 //   FROM inventory SHOW ending_inventory_retail_value
@@ -755,6 +761,8 @@ async function generateAIInsights(context) {
       thinking: { type: "adaptive" },
       system: `You are a business advisor (Chief Data Officer) for Gearevo, a knife/gear retailer in Malaysia selling through Shopify, Shopee, and TikTok Shop.
 
+${SEASONALITY_CONTEXT}
+
 Write 3-6 concise observations in plain business English, in the same style as: "Sales this month are only 45% of the RM120,000 target. Needs a push."
 
 Strict rules:
@@ -807,12 +815,15 @@ async function generateStrategicAnalysis(context) {
       thinking: { type: "adaptive" },
       system: `You are the Managing Director of Gearevo, a knife/gear retailer in Malaysia selling through Shopify, Shopee, and TikTok Shop. You are reviewing this snapshot to decide what to do next — not to describe the numbers, but to act on them.
 
+${SEASONALITY_CONTEXT}
+
 Think in two tiers, and make the tier explicit in what you write:
-1. DECIDE NOW — real-time/point-in-time facts that describe the business's current state and may need action this week (out-of-stock revenue exposure, dead stock capital, at-risk customer value). These aren't trends, they're the situation as of today.
+1. DECIDE NOW — real-time/point-in-time facts that describe the business's current state and may need action this week (out-of-stock revenue exposure, dead stock capital, at-risk customer value). These aren't trends, they're the situation as of today. Before flagging dead stock or a slow product as a problem, consider whether it's a seasonal item currently between seasons rather than genuinely dead.
 2. WATCH OR ACT ON TREND — anything given across multiple periods (concentrationByPeriod has thisMonth/lastMonth/last90d for product, customer, and channel concentration; monthlyTrend has multiple months of sales/margin/orders). For these, EXPLICITLY compare periods before concluding anything:
-   - If a concentration figure is high this month but was normal last month and over the 90-day baseline, call it a one-off (e.g. a single bulk order or a promo), not a structural risk — don't recommend restructuring the business over a single-month blip.
-   - If it's consistently high across this month, last month, AND the 90-day window, call it a real structural dependency and treat it as higher priority than a one-off.
-   - If growth or margin is moving consistently in one direction across the months given, say so plainly (growing/stagnant/declining) rather than hedging.
+   - First check whether a spike or drop lines up with the seasonal pattern above — if so, call it seasonal and move on, don't recommend restructuring the business over an expected cycle.
+   - If a concentration figure is high this month but was normal last month and over the 90-day baseline, AND it isn't explained by seasonality, call it a one-off (e.g. a single bulk order or a promo), not a structural risk.
+   - If it's consistently high across this month, last month, AND the 90-day window, and isn't seasonal, call it a real structural dependency and treat it as higher priority.
+   - If growth or margin is moving consistently in one direction across the months given, say so plainly (growing/stagnant/declining) rather than hedging — but check first whether that direction matches the expected seasonal cycle.
 
 Write 5-8 observations in plain business English, each 1-3 sentences. Cover, where the data supports it:
 - Overall trajectory verdict (growing/stagnant/declining) from monthlyTrend.
