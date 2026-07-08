@@ -96,11 +96,12 @@ node --env-file=.env sync.js
 
 ## Roadmap
 
-- **Phase 1 (this kit):** Shopify sales, margin, dead stock, stockout, daily email.
+- **Phase 1 (this kit):** Shopify sales, margin, dead stock, stockout, daily email. Done.
 - **Phase 2:** add cost/expense + ad spend (Facebook/TikTok ROAS) — needs their
-  own APIs, messier. For now type ad spend into Firestore manually if you want ROAS.
-- **Phase 3:** customer segmentation (RFM/VIP), basket analysis, real LLM advisor
-  (pipe the numbers to Gemini Flash free tier or Claude Haiku).
+  own APIs, messier. For now type ad spend into Firestore manually if you want ROAS. Not started.
+- **Phase 3:** customer segmentation (RFM/VIP), basket analysis, real LLM advisor. Done —
+  VIP/at-risk segmentation, concentration risk, basket analysis ("frequently bought
+  together" with lift), and a Claude-powered daily + strategic advisor are all live.
 
 ## Excluded SKUs
 
