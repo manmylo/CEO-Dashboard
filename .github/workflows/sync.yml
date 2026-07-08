@@ -42,4 +42,5 @@ jobs:
           FORCE_FULL: ${{ github.event.inputs.full }}
           FORCE_EMAIL: ${{ github.event.inputs.test_email }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ALLOWED_EMAILS: ${{ secrets.ALLOWED_EMAILS }}
         run: npm run sync

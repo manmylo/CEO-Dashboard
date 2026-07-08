@@ -95,6 +95,18 @@ async function releaseLock() {
   await db.doc("sync/lock").set({ lockedAt: null }, { merge: true });
 }
 
+// ---------- dashboard access allowlist ----------
+// Firestore rules check email membership against config/access, not a
+// hardcoded list in firestore.rules, since that file is committed to a
+// public repo. The real list lives only in this GitHub Actions secret.
+async function syncAllowlist() {
+  const raw = process.env.ALLOWED_EMAILS;
+  if (!raw) return; // secret not set yet — don't wipe an existing allowlist
+  const allowedEmails = raw.split(",").map((e) => e.trim().toLowerCase()).filter(Boolean);
+  if (!allowedEmails.length) return;
+  await db.doc("config/access").set({ allowedEmails, updatedAt: new Date().toISOString() });
+}
+
 // ---------- graphql helper (cost-aware throttling + pagination) ----------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -1163,6 +1175,8 @@ async function sendDailyEmailIfDue(freshMetrics, force) {
   }
 
   try {
+    await syncAllowlist();
+
     const forceFull = process.env.FORCE_FULL === "true";
     const forceEmail = process.env.FORCE_EMAIL === "true";
     const todayStr = myDateStr(new Date());
