@@ -68,6 +68,33 @@ function isInventoryExcludedTitle(title) {
 admin.initializeApp({ credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SA)) });
 const db = admin.firestore();
 
+// ---------- run lock ----------
+// The external cron (cronjobs.org) can trigger a new run while a previous one
+// (especially a full sync, which can take up to ~15 minutes) is still in
+// flight — without this, an overlapping quick sync would race the full
+// sync's Firestore writes, and worse, since mode selection is based on
+// sync/state.lastFullSyncDate (which the in-flight full sync hasn't written
+// yet), the overlapping run would ALSO decide to run "full" and double up
+// Shopify API calls. A Firestore transaction makes lock acquisition atomic
+// even if two runs start within moments of each other. LOCK_STALE_MS is a
+// safety net so a crashed/killed run (which never reaches the finally block)
+// doesn't permanently wedge every future run.
+const LOCK_STALE_MS = 20 * 60 * 1000; // comfortably longer than a full sync takes
+async function acquireLock() {
+  const lockRef = db.doc("sync/lock");
+  return db.runTransaction(async (tx) => {
+    const snap = await tx.get(lockRef);
+    const lockedAt = snap.exists ? snap.data().lockedAt : null;
+    const isStale = !lockedAt || (Date.now() - new Date(lockedAt).getTime()) > LOCK_STALE_MS;
+    if (lockedAt && !isStale) return false;
+    tx.set(lockRef, { lockedAt: new Date().toISOString() });
+    return true;
+  });
+}
+async function releaseLock() {
+  await db.doc("sync/lock").set({ lockedAt: null }, { merge: true });
+}
+
 // ---------- graphql helper (cost-aware throttling + pagination) ----------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -1129,23 +1156,32 @@ async function sendDailyEmailIfDue(freshMetrics, force) {
 
 // ---------- main ----------
 (async () => {
-  const forceFull = process.env.FORCE_FULL === "true";
-  const forceEmail = process.env.FORCE_EMAIL === "true";
-  const todayStr = myDateStr(new Date());
-
-  let mode = "quick";
-  if (forceFull) {
-    mode = "full";
-  } else {
-    const state = await db.doc("sync/state").get();
-    const lastFullSyncDate = state.exists ? state.data().lastFullSyncDate : null;
-    if (lastFullSyncDate !== todayStr) mode = "full";
+  const gotLock = await acquireLock();
+  if (!gotLock) {
+    console.log("Another sync run is already in progress — skipping this run (no lock, no Shopify calls, no writes).");
+    return;
   }
 
-  console.log(`Mode: ${mode.toUpperCase()}${forceFull ? " (forced)" : ""}`);
-  const metrics = mode === "full" ? await runFull() : await runQuick();
-  await sendDailyEmailIfDue(metrics, forceEmail);
+  try {
+    const forceFull = process.env.FORCE_FULL === "true";
+    const forceEmail = process.env.FORCE_EMAIL === "true";
+    const todayStr = myDateStr(new Date());
 
-  console.log("Done ✅");
-  process.exit(0);
-})().catch((e) => { console.error(e); process.exit(1); });
+    let mode = "quick";
+    if (forceFull) {
+      mode = "full";
+    } else {
+      const state = await db.doc("sync/state").get();
+      const lastFullSyncDate = state.exists ? state.data().lastFullSyncDate : null;
+      if (lastFullSyncDate !== todayStr) mode = "full";
+    }
+
+    console.log(`Mode: ${mode.toUpperCase()}${forceFull ? " (forced)" : ""}`);
+    const metrics = mode === "full" ? await runFull() : await runQuick();
+    await sendDailyEmailIfDue(metrics, forceEmail);
+
+    console.log("Done ✅");
+  } finally {
+    await releaseLock();
+  }
+})().then(() => process.exit(0)).catch((e) => { console.error(e); process.exit(1); });
