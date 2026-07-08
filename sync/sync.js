@@ -34,6 +34,8 @@ const REORDER_BUFFER_DAYS = 30; // extra buffer stock to hold on top of lead tim
 const EMAIL_HOUR_MYT = 8;       // send the daily report on the first run at/after this MYT hour
 const AT_RISK_DAYS = 180;       // repeat customer with no order in this long = at-risk (~6 months)
 const VIP_COUNT = 25;           // top N customers by lifetime spend
+const BASKET_MIN_COUNT = 3;     // pair must co-occur at least this many times to surface (noise floor)
+const BASKET_MAX_PAIRS = 15;    // cap on how many "frequently bought together" pairs to keep
 
 // Business is NOT uniform year-round, and sells across more categories than
 // just butcher knives — fed to both AI prompts so seasonal/promotional
@@ -392,6 +394,13 @@ function compute({ variantMap, orders }) {
   const dailySubtotal = {}, dailyOrders = {}, dailyRefunds = {}; // per MYT day, for the trend chart
   const dailyProductProfit = {}; // { [date]: { [pid]: {title, profit, revenue, units} } } — lets the
                                   // dashboard's "date range" filter aggregate any custom range client-side
+  // Basket analysis ("frequently bought together") — pair co-occurrence counts
+  // plus per-product order counts, so lift (co-occurrence vs. what you'd expect
+  // if the two products were bought independently) can be computed after the
+  // loop. basketTotalOrders is the denominator: orders with >=1 qualifying
+  // (non-excluded) product, not all 90-day orders.
+  const basketPairCounts = {}, basketProductOrders = {};
+  let basketTotalOrders = 0;
 
   for (const o of orders) {
     const created = new Date(o.createdAt);
@@ -446,6 +455,7 @@ function compute({ variantMap, orders }) {
       if (myMonthKey(r.createdAt) === monthKey) mtdRefunds += refundAmt;
     }
 
+    const basketSet = new Set(); // distinct qualifying pids in this order — see basket tally below
     for (const li of o.lineItems?.nodes || []) {
       if (isExcluded(li.sku)) continue; // exclude services from product analytics
       const vid = li.variant?.id;
@@ -463,6 +473,7 @@ function compute({ variantMap, orders }) {
 
       const pid = v?.productId || li.product?.id || li.product?.title || "unknown";
       const title = v?.productTitle || li.product?.title || "Unknown";
+      basketSet.add(pid);
       profitByProduct[pid] = profitByProduct[pid] || { title, profit: 0, revenue: 0, units: 0 };
       profitByProduct[pid].profit += lineRev - lineCost;
       profitByProduct[pid].revenue += lineRev;
@@ -486,7 +497,42 @@ function compute({ variantMap, orders }) {
       dp.revenue += lineRev;
       dp.units += qty;
     }
+
+    if (basketSet.size > 0) {
+      basketTotalOrders++;
+      for (const pid of basketSet) basketProductOrders[pid] = (basketProductOrders[pid] || 0) + 1;
+    }
+    if (basketSet.size >= 2) {
+      const items = [...basketSet].sort();
+      for (let i = 0; i < items.length; i++) {
+        for (let j = i + 1; j < items.length; j++) {
+          const key = `${items[i]}\u0000${items[j]}`;
+          basketPairCounts[key] = (basketPairCounts[key] || 0) + 1;
+        }
+      }
+    }
   }
+
+  // Lift = how much more often A and B are bought together than you'd expect
+  // if they were purchased independently (1.0 = pure chance, >1 = genuine
+  // association). Filters out pairs that just co-occur because both are
+  // bestsellers on their own — that's popularity, not a real cross-sell signal.
+  const basketAnalysis = Object.entries(basketPairCounts)
+    .map(([key, count]) => {
+      const [pidA, pidB] = key.split("\u0000");
+      const countA = basketProductOrders[pidA] || 0;
+      const countB = basketProductOrders[pidB] || 0;
+      const lift = basketTotalOrders && countA && countB
+        ? (count * basketTotalOrders) / (countA * countB) : 0;
+      return {
+        a: profitByProduct[pidA]?.title || "Unknown",
+        b: profitByProduct[pidB]?.title || "Unknown",
+        count, lift: money(lift),
+      };
+    })
+    .filter((p) => p.count >= BASKET_MIN_COUNT && p.lift > 1)
+    .sort((a, b) => b.lift - a.lift || b.count - a.count)
+    .slice(0, BASKET_MAX_PAIRS);
 
   const todaySales = todaySubtotal - todayRefunds;
   const mtdSales = mtdSubtotal - mtdRefunds;
@@ -658,6 +704,7 @@ function compute({ variantMap, orders }) {
     topProducts, topProductsMTD, totalProfit90: money(totalProfit90), // topProducts = full 90-day window (dashboard default); MTD = email only
     deadStock, stockAlerts: stockAlerts.slice(0, 20),
     stockOut, // deadStock/stockOut unsliced — dashboard shows first 20 with a "see more" toggle for the rest
+    basketAnalysis, // "frequently bought together" — top pairs by lift, 90-day window
     byRegion, byChannel, // both scoped to this month (MTD) — same window as mtd.sales
     ...computeInventory(variantMap),
     dailyTrend, monthlyOrderTrend, concentrationByPeriod, // all merged into businessAnalysis in runFull(), not written to dashboard/latest directly
@@ -884,6 +931,7 @@ Write 5-8 observations in plain business English, each 1-3 sentences. Cover, whe
 - Which concentration risks (product/customer/channel) are one-off vs structural, per the period-comparison rule above.
 - Capital efficiency: dead stock tied-up capital vs. revenue exposure from being out of stock — which is the bigger problem right now.
 - Customer base health: new customers vs. at-risk value, and whether the lifetime customer concentration figure suggests a different risk profile than the short-term ones.
+- If basketAnalysis has entries, call out the strongest cross-sell/bundle opportunity (highest lift) as a concrete action — e.g. bundling, "frequently bought together" placement, or a suggested promo pairing. Skip this if basketAnalysis is empty; don't force it.
 - 2-3 concrete, specific actions to take THIS MONTH, each tied to a specific number from the data (not generic advice like "monitor closely").
 
 Strict rules:
@@ -1067,6 +1115,7 @@ async function runFull() {
     newThisMonth: latest.customerSegments.newThisMonth,
     totalCustomers: latest.customerSegments.totalCustomers,
     endingInventoryRetailValue: latest.endingInventoryRetailValue,
+    basketAnalysis: (latest.basketAnalysis || []).slice(0, 5), // top cross-sell/bundle pairs, if any
   });
   if (strategicAnalysis) latest.businessAnalysis.strategicAnalysis = strategicAnalysis;
 
