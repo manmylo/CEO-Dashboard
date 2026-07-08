@@ -1,3 +1,11 @@
 node_modules/
 .env
 .firebase/
+
+# Deployed locally via `firebase deploy`, never through GitHub Actions —
+# kept out of the public repo since firestore.rules/index.html can carry
+# sensitive config. See README for local deploy instructions.
+public/
+firebase.json
+firestore.rules
+storage.rules
