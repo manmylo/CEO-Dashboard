@@ -220,26 +220,6 @@ const Q_CUSTOMERS = `
     }
   }`;
 
-// Lean order shape for quick (today-only) syncs — no lineItems/cost, since quick
-// runs only need net sales + order count, not margin/product analytics.
-const Q_ORDERS_QUICK = `
-  query($cursor: String, $q: String) {
-    orders(first: 50, after: $cursor, query: $q, sortKey: CREATED_AT) {
-      pageInfo { hasNextPage endCursor }
-      nodes {
-        id createdAt
-        subtotalPriceSet { shopMoney { amount } }
-        refunds {
-          createdAt
-          processedAt
-          refundLineItems(first: 250) {
-            nodes { subtotalSet { shopMoney { amount } } }
-          }
-        }
-      }
-    }
-  }`;
-
 // ---------- pull ----------
 const num = (x) => Number(x || 0);
 function daysAgoISO(n) { return new Date(Date.now() - n * 864e5).toISOString(); }
@@ -378,13 +358,6 @@ function toMYT(dateInput) { return new Date(new Date(dateInput).getTime() + MY_O
 function myDateStr(dateInput) { return toMYT(dateInput).toISOString().slice(0, 10); }
 function myMonthKey(dateInput) { return toMYT(dateInput).toISOString().slice(0, 7); }
 function myYesterdayStr() { return myDateStr(new Date(Date.now() - 24 * 60 * 60 * 1000)); }
-// The UTC instant corresponding to 00:00 MYT today — used to scope quick-sync's
-// Shopify query to "today only" instead of re-fetching 90 days of orders.
-function todayStartUtcISO() {
-  const nowMy = toMYT(new Date());
-  const wallClockUtcMs = Date.UTC(nowMy.getUTCFullYear(), nowMy.getUTCMonth(), nowMy.getUTCDate());
-  return new Date(wallClockUtcMs - MY_OFFSET_MS).toISOString();
-}
 
 function compute({ variantMap, orders, monthlyTarget }) {
   const TARGET = monthlyTarget || 0;
@@ -743,40 +716,29 @@ function compute({ variantMap, orders, monthlyTarget }) {
   };
 }
 
-// ---------- quick sync (today only — no product/90-day pull) ----------
-async function pullQuickToday() {
-  const startIso = todayStartUtcISO();
-  console.log(`Quick sync — fetching today's orders (since ${startIso})…`);
-  const created = await paginate(Q_ORDERS_QUICK, (d) => d.orders, { q: `created_at:>=${startIso} status:any` });
-  const updated = await paginate(Q_ORDERS_QUICK, (d) => d.orders, { q: `updated_at:>=${startIso} status:any` });
-  return { created, updated };
-}
-
-function computeQuickToday({ created, updated }) {
-  const todayStr = myDateStr(new Date());
-
-  let todaySubtotal = 0, todayOrders = 0;
-  for (const o of created) {
-    if (myDateStr(o.createdAt) !== todayStr) continue;
-    todaySubtotal += num(o.subtotalPriceSet?.shopMoney?.amount);
-    todayOrders++;
-  }
-
-  let todayRefunds = 0;
-  for (const o of updated) {
-    for (const r of o.refunds || []) {
-      const refundAt = r.processedAt || r.createdAt;
-      if (myDateStr(refundAt) !== todayStr) continue;
-      todayRefunds += (r.refundLineItems?.nodes || []).reduce(
-        (s, rli) => s + num(rli.subtotalSet?.shopMoney?.amount), 0
-      );
-    }
-  }
-
+// ---------- quick sync (today only — reads the sales dashboard's own live
+// Shopify pull instead of re-fetching Shopify ourselves) ----------
+// The Gearevo sales dashboard (gearevo-dashboard-7f782) already computes
+// today's net sales + order count on its own cron, using the same net-sales
+// definition (status:any, refunds dated by processedAt). Rather than run a
+// second, independently-drifting Shopify fetch here just for the "today"
+// tile, quick sync reads that project's own sales/today doc directly — its
+// Firestore rules allow open reads, no credentials needed. If that read
+// fails for any reason, this run is skipped entirely (today's tile just
+// keeps its last known value until the next successful run) rather than
+// falling back to a second, possibly-diverging Shopify fetch.
+const OTHER_PROJECT_ID = "gearevo-dashboard-7f782";
+async function pullTodayFromOtherProject() {
+  const url = `https://firestore.googleapis.com/v1/projects/${OTHER_PROJECT_ID}/databases/(default)/documents/sales/today`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Sales dashboard fetch failed: ${res.status}`);
+  const body = await res.json();
+  const fields = body.fields || {};
+  const numField = (k) => Number(fields[k]?.doubleValue ?? fields[k]?.integerValue ?? 0);
   return {
-    date: todayStr,
+    date: myDateStr(new Date()),
     generatedAt: new Date().toISOString(),
-    today: { sales: money(todaySubtotal - todayRefunds), orders: todayOrders },
+    today: { sales: money(numField("currentSale")), orders: numField("totalOrders") },
   };
 }
 
@@ -1172,14 +1134,22 @@ async function runFull() {
 }
 
 async function runQuick() {
-  // Orders (today only) and products/inventory (always live, not tied to the
-  // 90-day order window) both refresh every quick run. The monthly target
-  // is NOT fetched here — the dashboard reads the Target card straight from
-  // Firestore itself (live onSnapshot listener), so it updates instantly
-  // whenever staff edit it, with no sync round-trip needed at all. sync.js
-  // only fetches it during a full sync, for the email report and AI context.
-  const [todayRaw, variantMap] = await Promise.all([pullQuickToday(), pullProducts()]);
-  const q = computeQuickToday(todayRaw);
+  // Today's sales figure comes from the Gearevo sales dashboard's own
+  // Firestore now (see pullTodayFromOtherProject above), not a second
+  // Shopify fetch — if that read fails, the whole run is skipped rather
+  // than falling back to a fetch that could independently drift again.
+  // Products/inventory (always live, not tied to the 90-day order window)
+  // still refresh every quick run. The monthly target is NOT fetched here —
+  // the dashboard reads the Target card straight from Firestore itself
+  // (live onSnapshot listener), updating instantly with no sync round-trip.
+  let q;
+  try {
+    q = await pullTodayFromOtherProject();
+  } catch (err) {
+    console.log(`Quick sync — skipped (sales dashboard read failed: ${err.message}).`);
+    return null;
+  }
+  const variantMap = await pullProducts();
   const inv = computeInventory(variantMap);
 
   // dashboard/latest always gets a fresh write — Firestore bills per document
