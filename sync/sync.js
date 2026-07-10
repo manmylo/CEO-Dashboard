@@ -557,6 +557,19 @@ function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
   // quick syncs' merge writes to `today` don't wipe it between full syncs.
   const yesterdayEntry = dailyTrend.find((d) => d.date === myYesterdayStr());
   const yesterdaySales = yesterdayEntry ? yesterdayEntry.todaySales : 0;
+  const yesterdayOrders = yesterdayEntry ? yesterdayEntry.orders : 0;
+
+  // MTD through yesterday only (excludes today entirely) — for the AI advisor
+  // commentary. Full sync runs once per MYT day, at the first sync after
+  // midnight, so "today" has barely any sales yet at that moment; basing the
+  // advisor's MTD figure on `mtd` above made its commentary a near-empty
+  // snapshot that then stayed frozen (wrong) for the rest of the day while
+  // the dashboard's own KPIs kept updating live. This is fully finalized and
+  // never goes stale during the day.
+  let mtdSalesThroughYesterday = 0, mtdOrdersThroughYesterday = 0;
+  for (const [d, v] of dashboardDaily) {
+    if (d.slice(0, 7) === monthKey && d !== todayStr) { mtdSalesThroughYesterday += v.sales; mtdOrdersThroughYesterday += v.orders; }
+  }
 
   const grossProfit = mtdSales - mtdCost;
   const margin = mtdSales ? (grossProfit / mtdSales) * 100 : 0;
@@ -689,6 +702,11 @@ function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
     generatedAt: now.toISOString(), date: todayStr,
     today: { sales: money(todaySales), orders: todayOrders },
     yesterdaySales: money(yesterdaySales), // top-level — see note above dailyTrend/yesterdayEntry
+    yesterday: { sales: money(yesterdaySales), orders: yesterdayOrders }, // AI advisor context only
+    mtdThroughYesterday: {
+      sales: money(mtdSalesThroughYesterday), orders: mtdOrdersThroughYesterday,
+      target: TARGET, targetPct: TARGET ? money((mtdSalesThroughYesterday / TARGET) * 100) : 0,
+    }, // AI advisor context only — see note above mtdSalesThroughYesterday
     mtd: {
       sales: money(mtdSales), orders: mtdOrders,
       aov: mtdOrders ? money(mtdSales / mtdOrders) : 0,
@@ -886,10 +904,11 @@ Strict rules:
 - Only use the numbers given below. DO NOT invent figures, trends, or product names that aren't in the data.
 - Don't force an observation for a metric that has no issue — prioritize the most important and actionable points first.
 - Keep each sentence short (1-2 sentences), including a suggested action where relevant.
-- Also mention something positive if there is one, not just problems.`,
+- Also mention something positive if there is one, not just problems.
+- All figures below (yesterday, mtdThroughYesterday, weekOverWeek) are through the end of asOfDate, a fully completed day — NOT a live, still-accumulating "today." Phrase observations that way (e.g. "MTD sales through [date]" or "yesterday's sales"), never as "so far today" or "as of now."`,
       messages: [{
         role: "user",
-        content: `Gearevo business data for ${context.date}:\n\n${JSON.stringify(context, null, 2)}`,
+        content: `Gearevo business data as of the end of ${context.asOfDate}:\n\n${JSON.stringify(context, null, 2)}`,
       }],
       output_config: {
         format: {
@@ -1083,13 +1102,23 @@ async function runFull() {
     latest.insights.push(`${latest.customerSegments.atRisk.length} repeat customers haven't ordered in >6 months — consider reaching out.`);
   }
 
-  const last7 = dailyTrend.slice(-7).reduce((s, d) => s + d.todaySales, 0);
-  const prev7 = dailyTrend.slice(-14, -7).reduce((s, d) => s + d.todaySales, 0);
+  // Excludes today from both windows — full sync runs once per MYT day, right
+  // after midnight, so today's entry is still ~empty at that point and would
+  // otherwise silently drag last7DaysSales down by a full day's worth of
+  // sales for no real reason. See mtdThroughYesterday's comment in compute().
+  const trendThroughYesterday = dailyTrend.filter((d) => d.date !== latest.date);
+  const last7 = trendThroughYesterday.slice(-7).reduce((s, d) => s + d.todaySales, 0);
+  const prev7 = trendThroughYesterday.slice(-14, -7).reduce((s, d) => s + d.todaySales, 0);
   const aiInsights = await generateAIInsights({
-    date: latest.date,
-    today: latest.today,
-    yesterdaySales: latest.yesterdaySales,
-    mtd: latest.mtd,
+    // Everything here is "as of the end of yesterday," not "as of right now" —
+    // full sync (and this AI call) runs once per MYT day, at the first sync
+    // after midnight, when today has barely started. Using live/today figures
+    // made the advisor's commentary a near-empty snapshot that then stayed
+    // frozen (and increasingly wrong) for the rest of the day while the
+    // dashboard's own KPIs kept updating live from the sales dashboard.
+    asOfDate: myYesterdayStr(),
+    yesterday: latest.yesterday,
+    mtdThroughYesterday: latest.mtdThroughYesterday,
     returnsRate: latest.returnsRate,
     weekOverWeek: {
       last7DaysSales: money(last7),
