@@ -11,6 +11,10 @@ on:
         description: "Force-send the EmailJS report right now, ignoring the 8am MYT / once-a-day gate"
         type: boolean
         default: false
+      backfill:
+        description: "Backfill daily sales history from the Gearevo sales dashboard's Firestore (one-off, skips Shopify + email)"
+        type: boolean
+        default: false
 
 jobs:
   sync:
@@ -41,6 +45,7 @@ jobs:
           REPORT_TO: ${{ secrets.REPORT_TO }}
           FORCE_FULL: ${{ github.event.inputs.full }}
           FORCE_EMAIL: ${{ github.event.inputs.test_email }}
+          FORCE_BACKFILL: ${{ github.event.inputs.backfill }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ALLOWED_EMAILS: ${{ secrets.ALLOWED_EMAILS }}
         run: npm run sync

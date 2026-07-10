@@ -1133,6 +1133,58 @@ async function runFull() {
   return metrics;
 }
 
+// One-off: bulk-copy the sales dashboard's entire daily history into our own
+// daily/{date} collection (todaySales/orders only — that's all it has). Use
+// this to backfill dates outside sync.js's own 90-day Shopify window, or to
+// re-align history after the dashboard resyncs its own numbers. Paginates
+// through the whole sales/daily/days subcollection via Firestore's REST API
+// (open rules, no credentials needed) and writes in batches of 400.
+async function runBackfillFromDashboard() {
+  console.log(`Backfill — fetching all daily docs from ${OTHER_PROJECT_ID}...`);
+  const baseUrl = `https://firestore.googleapis.com/v1/projects/${OTHER_PROJECT_ID}/databases/(default)/documents/sales/daily/days`;
+  let pageToken = null;
+  let synced = 0;
+
+  do {
+    const url = new URL(baseUrl);
+    url.searchParams.set("pageSize", "300");
+    if (pageToken) url.searchParams.set("pageToken", pageToken);
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`Backfill fetch failed: ${res.status}`);
+    const body = await res.json();
+    const docs = body.documents || [];
+
+    let batch = db.batch();
+    let inBatch = 0;
+    for (const doc of docs) {
+      const fields = doc.fields || {};
+      const numField = (k) => Number(fields[k]?.doubleValue ?? fields[k]?.integerValue ?? 0);
+      const dateStr = fields.date?.stringValue || doc.name.split("/").pop();
+      if (!dateStr) continue;
+
+      batch.set(db.doc(`daily/${dateStr}`), {
+        date: dateStr,
+        todaySales: numField("currentSale"),
+        orders: numField("totalOrders"),
+      }, { merge: true });
+      inBatch++;
+      synced++;
+
+      if (inBatch >= 400) {
+        await batch.commit();
+        batch = db.batch();
+        inBatch = 0;
+      }
+    }
+    if (inBatch > 0) await batch.commit();
+
+    pageToken = body.nextPageToken || null;
+  } while (pageToken);
+
+  console.log(`Backfill — synced ${synced} daily docs from the sales dashboard.`);
+  return null;
+}
+
 async function runQuick() {
   // Today's sales figure comes from the Gearevo sales dashboard's own
   // Firestore now (see pullTodayFromOtherProject above), not a second
@@ -1233,6 +1285,13 @@ async function sendDailyEmailIfDue(freshMetrics, force) {
 
   try {
     await syncAllowlist();
+
+    if (process.env.FORCE_BACKFILL === "true") {
+      console.log("Mode: BACKFILL (from sales dashboard) — skipping Shopify + email.");
+      await runBackfillFromDashboard();
+      console.log("Done ✅");
+      return;
+    }
 
     const forceFull = process.env.FORCE_FULL === "true";
     const forceEmail = process.env.FORCE_EMAIL === "true";
