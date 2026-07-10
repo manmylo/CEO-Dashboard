@@ -1163,9 +1163,12 @@ async function runFull() {
 }
 
 async function runQuick() {
-  // Orders (today only) and products/inventory (always live, not tied to the
-  // 90-day order window) both refresh every quick run.
-  const [todayRaw, variantMap] = await Promise.all([pullQuickToday(), pullProducts()]);
+  // Orders (today only), products/inventory (always live, not tied to the
+  // 90-day order window), and the current month's target (staff can change
+  // the Target card anytime) all refresh every quick run.
+  const [todayRaw, variantMap, monthlyTarget] = await Promise.all(
+    [pullQuickToday(), pullProducts(), getCurrentMonthTarget()]
+  );
   const q = computeQuickToday(todayRaw);
   const inv = computeInventory(variantMap);
 
@@ -1179,16 +1182,30 @@ async function runQuick() {
   const prev = prevSnap.exists ? prevSnap.data() : {};
   const salesChanged = prev.today?.sales !== q.today.sales || prev.today?.orders !== q.today.orders;
 
+  // Target% is recomputed against whatever mtd.sales the last FULL sync
+  // computed — quick sync doesn't re-pull 90 days of orders, so that figure
+  // itself only refreshes once/day, but the target number and its % against
+  // that figure now update on every quick run instead of waiting for
+  // tomorrow's full sync. Dotted keys here are precise field paths (only
+  // mtd.target/mtd.targetPct change), not a nested object — a nested
+  // `{mtd: {...}}` value would wipe out mtd.sales/margin/etc. on merge.
+  const prevMtdSales = prev.mtd?.sales || 0;
+  const targetPatch = {
+    "mtd.target": monthlyTarget,
+    "mtd.targetPct": monthlyTarget ? money((prevMtdSales / monthlyTarget) * 100) : 0,
+  };
+
   const batch = db.batch();
   batch.set(db.doc("dashboard/latest"),
-    { date: q.date, generatedAt: q.generatedAt, today: q.today, ...inv }, { merge: true });
+    { date: q.date, generatedAt: q.generatedAt, today: q.today, ...inv, ...targetPatch }, { merge: true });
   if (salesChanged) {
     batch.set(db.doc(`daily/${q.date}`),
       { date: q.date, todaySales: q.today.sales, orders: q.today.orders }, { merge: true });
   }
   await batch.commit();
   console.log(`Quick sync — today RM${q.today.sales} (${q.today.orders} orders), `
-    + `inventory RM${inv.endingInventoryRetailValue}${salesChanged ? "" : " (sales unchanged, daily doc write skipped)"}.`);
+    + `inventory RM${inv.endingInventoryRetailValue}, target RM${monthlyTarget || "not set"}`
+    + `${salesChanged ? "" : " (sales unchanged, daily doc write skipped)"}.`);
   return null;
 }
 
