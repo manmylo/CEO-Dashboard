@@ -281,17 +281,25 @@ async function pull() {
   console.log("Fetching products + cost + stock…");
   const variantMap = await pullProducts();
 
+  // Orders are still pulled from Shopify — margin/cost/products/customers/
+  // channels/regions/dead-stock/basket analysis all need line-item-level
+  // data the sales dashboard doesn't have. Only sales $ and order counts
+  // (today/month/daily trend) come from dashboardDaily below — see compute().
   console.log("Fetching orders (last 90 days)…");
   // status:any is required — Shopify's Admin API excludes cancelled/closed
   // orders by default when no status filter is given, which would silently
-  // break the "count cancelled orders, net out via refund" logic below.
+  // break the "count cancelled orders" logic below.
   const q = `created_at:>=${daysAgoISO(DEADSTOCK_DAYS)} status:any`;
   const orders = await paginate(Q_ORDERS, (d) => d.orders, { q });
+
+  console.log(`Fetching daily sales history from ${OTHER_PROJECT_ID}...`);
+  const dashboardDaily = await fetchAllDailySalesFromDashboard();
+  console.log(`Sales dashboard — ${dashboardDaily.size} days of history.`);
 
   const monthlyTarget = await getCurrentMonthTarget();
   console.log(`Monthly target: ${monthlyTarget ? "RM" + monthlyTarget : "not set for this month"}`);
 
-  return { variantMap, orders, monthlyTarget };
+  return { variantMap, orders, monthlyTarget, dashboardDaily };
 }
 
 // ---------- compute ----------
@@ -359,7 +367,7 @@ function myDateStr(dateInput) { return toMYT(dateInput).toISOString().slice(0, 1
 function myMonthKey(dateInput) { return toMYT(dateInput).toISOString().slice(0, 7); }
 function myYesterdayStr() { return myDateStr(new Date(Date.now() - 24 * 60 * 60 * 1000)); }
 
-function compute({ variantMap, orders, monthlyTarget }) {
+function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
   const TARGET = monthlyTarget || 0;
   const now = new Date();
   const nowMy = toMYT(now);
@@ -372,8 +380,7 @@ function compute({ variantMap, orders, monthlyTarget }) {
   if (lmMonth < 0) { lmMonth = 11; lmYear -= 1; }
   const lastMonthKey = `${lmYear}-${String(lmMonth + 1).padStart(2, "0")}`;
 
-  let todaySubtotal = 0, todayOrders = 0, todayRefunds = 0;
-  let mtdSubtotal = 0, mtdOrders = 0, mtdCost = 0, mtdRefunds = 0;
+  let mtdCost = 0;
   let mtdGrossTotal = 0, mtdRefundTotalOnOrder = 0;
   let refundTotal = 0, grossTotal = 0, cancelledOrders = 0;
   const byRegion = {}, byChannel = {}; // scoped to this month (MTD) — see targetPct-style window below
@@ -392,7 +399,6 @@ function compute({ variantMap, orders, monthlyTarget }) {
   const soldUnits7 = {}, soldUnits30 = {}, soldUnits90 = {};
   const profitByProduct = {};    // full 90-day window — dashboard's default "All" view
   const profitByProductMTD = {}; // this month only — used by the email report
-  const dailySubtotal = {}, dailyOrders = {}, dailyRefunds = {}; // per MYT day, for the trend chart
   const dailyProductProfit = {}; // { [date]: { [pid]: {title, profit, revenue, units} } } — lets the
                                   // dashboard's "date range" filter aggregate any custom range client-side
   // Basket analysis ("frequently bought together") — pair co-occurrence counts
@@ -436,27 +442,6 @@ function compute({ variantMap, orders, monthlyTarget }) {
     } else if (createdMonthKey === lastMonthKey) {
       byChannelLastMonth[ch] = (byChannelLastMonth[ch] || 0) + total;
       if (custId) customerRevLastMonth[custId] = (customerRevLastMonth[custId] || 0) + subtotal;
-    }
-
-    // Sales: every order placed in the window counts on its ORDER date, incl. later-cancelled
-    // ones — exactly like Shopify. A cancellation nets out via its refund below.
-    dailySubtotal[createdDateStr] = (dailySubtotal[createdDateStr] || 0) + subtotal;
-    dailyOrders[createdDateStr] = (dailyOrders[createdDateStr] || 0) + 1;
-    if (createdDateStr === todayStr) { todaySubtotal += subtotal; todayOrders++; }
-    if (createdMonthKey === monthKey) { mtdSubtotal += subtotal; mtdOrders++; }
-
-    // Refunds: dated by the REFUND's PROCESSED date (matches sync.py / Shopify
-    // Analytics convention), not createdAt — a refund can be created one day
-    // and processed the next, and processedAt is what actually moves money.
-    for (const r of o.refunds || []) {
-      const refundAmt = (r.refundLineItems?.nodes || []).reduce(
-        (s, rli) => s + num(rli.subtotalSet?.shopMoney?.amount), 0
-      );
-      const refundAt = r.processedAt || r.createdAt;
-      const refundDateStr = myDateStr(refundAt);
-      dailyRefunds[refundDateStr] = (dailyRefunds[refundDateStr] || 0) + refundAmt;
-      if (refundDateStr === todayStr) todayRefunds += refundAmt;
-      if (myMonthKey(refundAt) === monthKey) mtdRefunds += refundAmt;
     }
 
     const basketSet = new Set(); // distinct qualifying pids in this order — see basket tally below
@@ -538,19 +523,29 @@ function compute({ variantMap, orders, monthlyTarget }) {
     .sort((a, b) => b.lift - a.lift || b.count - a.count)
     .slice(0, BASKET_MAX_PAIRS);
 
-  const todaySales = todaySubtotal - todayRefunds;
-  const mtdSales = mtdSubtotal - mtdRefunds;
+  // Sales and order counts (today, this month, and every day in the trend)
+  // come from the Gearevo sales dashboard's own Firestore now, not from a
+  // second, independently-computed Shopify pull — see pull() and
+  // fetchAllDailySalesFromDashboard(). Only margin/cost/products/customers
+  // below still need our own line-item-level Shopify pull, since the sales
+  // dashboard doesn't have that data.
+  const todayEntry = dashboardDaily.get(todayStr);
+  const todaySales = todayEntry ? todayEntry.sales : 0;
+  const todayOrders = todayEntry ? todayEntry.orders : 0;
 
-  // Recomputed fresh from Shopify on every run (not just today) so a day's numbers
-  // self-correct if a refund lands on it after the fact — see dailyRefunds above.
+  let mtdSales = 0, mtdOrders = 0;
+  for (const [d, v] of dashboardDaily) {
+    if (d.slice(0, 7) === monthKey) { mtdSales += v.sales; mtdOrders += v.orders; }
+  }
+
   // `products` lets the dashboard's date-range filter sum any custom range
   // client-side without a fresh Shopify pull — refreshed once/day (full sync).
-  const dailyTrend = Object.keys({ ...dailySubtotal, ...dailyRefunds })
+  const dailyTrend = Array.from(dashboardDaily.keys())
     .sort()
     .map((d) => ({
       date: d,
-      todaySales: money((dailySubtotal[d] || 0) - (dailyRefunds[d] || 0)),
-      orders: dailyOrders[d] || 0,
+      todaySales: money(dashboardDaily.get(d)?.sales || 0),
+      orders: dashboardDaily.get(d)?.orders || 0,
       products: Object.entries(dailyProductProfit[d] || {}).map(([pid, p]) => ({
         pid, title: p.title, profit: money(p.profit), revenue: money(p.revenue), units: p.units,
       })),
@@ -728,6 +723,38 @@ function compute({ variantMap, orders, monthlyTarget }) {
 // keeps its last known value until the next successful run) rather than
 // falling back to a second, possibly-diverging Shopify fetch.
 const OTHER_PROJECT_ID = "gearevo-dashboard-7f782";
+
+// Full history from the sales dashboard's sales/daily/days collection, as a
+// Map<dateStr, {sales, orders}> — used by pull() to source every day's sales
+// figure (see compute() below) and by the standalone backfill mode. Paginates
+// through the whole collection via Firestore's REST API (open rules, no
+// credentials needed).
+async function fetchAllDailySalesFromDashboard() {
+  const baseUrl = `https://firestore.googleapis.com/v1/projects/${OTHER_PROJECT_ID}/databases/(default)/documents/sales/daily/days`;
+  let pageToken = null;
+  const map = new Map();
+
+  do {
+    const url = new URL(baseUrl);
+    url.searchParams.set("pageSize", "300");
+    if (pageToken) url.searchParams.set("pageToken", pageToken);
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`Sales dashboard fetch failed: ${res.status}`);
+    const body = await res.json();
+
+    for (const doc of body.documents || []) {
+      const fields = doc.fields || {};
+      const numField = (k) => Number(fields[k]?.doubleValue ?? fields[k]?.integerValue ?? 0);
+      const dateStr = fields.date?.stringValue || doc.name.split("/").pop();
+      if (!dateStr) continue;
+      map.set(dateStr, { sales: numField("currentSale"), orders: numField("totalOrders") });
+    }
+    pageToken = body.nextPageToken || null;
+  } while (pageToken);
+
+  return map;
+}
+
 async function pullTodayFromOtherProject() {
   const url = `https://firestore.googleapis.com/v1/projects/${OTHER_PROJECT_ID}/databases/(default)/documents/sales/today`;
   const res = await fetch(url);
@@ -1115,11 +1142,24 @@ async function runFull() {
   });
   if (strategicAnalysis) latest.businessAnalysis.strategicAnalysis = strategicAnalysis;
 
+  // dailyTrend now spans the sales dashboard's entire history (not capped at
+  // 90 days), so it's chunked into its own batches — Firestore caps a single
+  // batch at 500 writes, and this collection only grows over time.
+  let dailyBatch = db.batch();
+  let dailyBatchCount = 0;
+  for (const day of dailyTrend) {
+    dailyBatch.set(db.doc(`daily/${day.date}`), day);
+    dailyBatchCount++;
+    if (dailyBatchCount >= 400) {
+      await dailyBatch.commit();
+      dailyBatch = db.batch();
+      dailyBatchCount = 0;
+    }
+  }
+  if (dailyBatchCount > 0) await dailyBatch.commit();
+
   const batch = db.batch();
   batch.set(db.doc("dashboard/latest"), latest);
-  for (const day of dailyTrend) {
-    batch.set(db.doc(`daily/${day.date}`), day);
-  }
   // Persisted separately from dashboard/latest (which only holds whatever's in
   // the current 90-day pull) so a month keeps its final orders/returns/
   // cancellations numbers permanently, even after it ages out of that window —
@@ -1134,52 +1174,27 @@ async function runFull() {
 }
 
 // One-off: bulk-copy the sales dashboard's entire daily history into our own
-// daily/{date} collection (todaySales/orders only — that's all it has). Use
-// this to backfill dates outside sync.js's own 90-day Shopify window, or to
-// re-align history after the dashboard resyncs its own numbers. Paginates
-// through the whole sales/daily/days subcollection via Firestore's REST API
-// (open rules, no credentials needed) and writes in batches of 400.
+// daily/{date} collection (todaySales/orders only — that's all it has). Full
+// sync already does this as part of every run (see pull()); this mode exists
+// to refresh daily/{date} on demand without waiting for/triggering a full
+// Shopify pull too.
 async function runBackfillFromDashboard() {
   console.log(`Backfill — fetching all daily docs from ${OTHER_PROJECT_ID}...`);
-  const baseUrl = `https://firestore.googleapis.com/v1/projects/${OTHER_PROJECT_ID}/databases/(default)/documents/sales/daily/days`;
-  let pageToken = null;
-  let synced = 0;
+  const dashboardDaily = await fetchAllDailySalesFromDashboard();
 
-  do {
-    const url = new URL(baseUrl);
-    url.searchParams.set("pageSize", "300");
-    if (pageToken) url.searchParams.set("pageToken", pageToken);
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`Backfill fetch failed: ${res.status}`);
-    const body = await res.json();
-    const docs = body.documents || [];
-
-    let batch = db.batch();
-    let inBatch = 0;
-    for (const doc of docs) {
-      const fields = doc.fields || {};
-      const numField = (k) => Number(fields[k]?.doubleValue ?? fields[k]?.integerValue ?? 0);
-      const dateStr = fields.date?.stringValue || doc.name.split("/").pop();
-      if (!dateStr) continue;
-
-      batch.set(db.doc(`daily/${dateStr}`), {
-        date: dateStr,
-        todaySales: numField("currentSale"),
-        orders: numField("totalOrders"),
-      }, { merge: true });
-      inBatch++;
-      synced++;
-
-      if (inBatch >= 400) {
-        await batch.commit();
-        batch = db.batch();
-        inBatch = 0;
-      }
+  let batch = db.batch();
+  let inBatch = 0, synced = 0;
+  for (const [dateStr, { sales, orders }] of dashboardDaily) {
+    batch.set(db.doc(`daily/${dateStr}`), { date: dateStr, todaySales: sales, orders }, { merge: true });
+    inBatch++;
+    synced++;
+    if (inBatch >= 400) {
+      await batch.commit();
+      batch = db.batch();
+      inBatch = 0;
     }
-    if (inBatch > 0) await batch.commit();
-
-    pageToken = body.nextPageToken || null;
-  } while (pageToken);
+  }
+  if (inBatch > 0) await batch.commit();
 
   console.log(`Backfill — synced ${synced} daily docs from the sales dashboard.`);
   return null;
