@@ -182,6 +182,7 @@ const Q_ORDERS = `
         customer { id }
         refunds {
           createdAt
+          processedAt
           refundLineItems(first: 250) {
             nodes { subtotalSet { shopMoney { amount } } }
           }
@@ -230,6 +231,7 @@ const Q_ORDERS_QUICK = `
         subtotalPriceSet { shopMoney { amount } }
         refunds {
           createdAt
+          processedAt
           refundLineItems(first: 250) {
             nodes { subtotalSet { shopMoney { amount } } }
           }
@@ -470,15 +472,18 @@ function compute({ variantMap, orders, monthlyTarget }) {
     if (createdDateStr === todayStr) { todaySubtotal += subtotal; todayOrders++; }
     if (createdMonthKey === monthKey) { mtdSubtotal += subtotal; mtdOrders++; }
 
-    // Refunds: dated by the REFUND's own date, regardless of which day the order was created.
+    // Refunds: dated by the REFUND's PROCESSED date (matches sync.py / Shopify
+    // Analytics convention), not createdAt — a refund can be created one day
+    // and processed the next, and processedAt is what actually moves money.
     for (const r of o.refunds || []) {
       const refundAmt = (r.refundLineItems?.nodes || []).reduce(
         (s, rli) => s + num(rli.subtotalSet?.shopMoney?.amount), 0
       );
-      const refundDateStr = myDateStr(r.createdAt);
+      const refundAt = r.processedAt || r.createdAt;
+      const refundDateStr = myDateStr(refundAt);
       dailyRefunds[refundDateStr] = (dailyRefunds[refundDateStr] || 0) + refundAmt;
       if (refundDateStr === todayStr) todayRefunds += refundAmt;
-      if (myMonthKey(r.createdAt) === monthKey) mtdRefunds += refundAmt;
+      if (myMonthKey(refundAt) === monthKey) mtdRefunds += refundAmt;
     }
 
     const basketSet = new Set(); // distinct qualifying pids in this order — see basket tally below
@@ -760,7 +765,8 @@ function computeQuickToday({ created, updated }) {
   let todayRefunds = 0;
   for (const o of updated) {
     for (const r of o.refunds || []) {
-      if (myDateStr(r.createdAt) !== todayStr) continue;
+      const refundAt = r.processedAt || r.createdAt;
+      if (myDateStr(refundAt) !== todayStr) continue;
       todayRefunds += (r.refundLineItems?.nodes || []).reduce(
         (s, rli) => s + num(rli.subtotalSet?.shopMoney?.amount), 0
       );
