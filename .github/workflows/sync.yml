@@ -1,6 +1,8 @@
 name: Gearevo BI sync
 
 on:
+  schedule:
+    - cron: "*/2 * * * *" # GitHub's practical floor is ~5 min regardless — see runbook note below
   workflow_dispatch:
     inputs:
       full:
@@ -37,7 +39,6 @@ jobs:
           SHOP_TOKEN: ${{ secrets.SHOP_TOKEN }}
           SHOP_API_VERSION: ${{ secrets.SHOP_API_VERSION }}
           FIREBASE_SA: ${{ secrets.FIREBASE_SA }}
-          MONTHLY_TARGET: ${{ secrets.MONTHLY_TARGET }}
           EMAILJS_SERVICE_ID: ${{ secrets.EMAILJS_SERVICE_ID }}
           EMAILJS_TEMPLATE_ID: ${{ secrets.EMAILJS_TEMPLATE_ID }}
           EMAILJS_PUBLIC_KEY: ${{ secrets.EMAILJS_PUBLIC_KEY }}
