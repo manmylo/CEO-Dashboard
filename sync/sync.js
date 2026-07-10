@@ -8,10 +8,15 @@
  *
  * Env (GitHub repo Secrets):
  *   SHOP_DOMAIN, SHOP_TOKEN, SHOP_API_VERSION (e.g. 2026-01),
- *   FIREBASE_SA, MONTHLY_TARGET,
+ *   FIREBASE_SA,
  *   EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, EMAILJS_PUBLIC_KEY, EMAILJS_PRIVATE_KEY, REPORT_TO
  *   ANTHROPIC_API_KEY (optional — AI-generated advisor insights; falls back to
  *   rule-based buildInsights() if unset or the call fails)
+ *
+ * The monthly sales target is NOT an env var — it's set by staff via a
+ * Target card dropped on the current month in the dashboard's Calendar
+ * (Year view). See getCurrentMonthTarget() below. If no Target card exists
+ * for the current month, target is 0 and the dashboard shows "no target set".
  */
 
 import admin from "firebase-admin";
@@ -22,7 +27,6 @@ import { isExcluded } from "./excluded-skus.js";
 const SHOP = process.env.SHOP_DOMAIN;
 const TOKEN = process.env.SHOP_TOKEN;
 const VER = process.env.SHOP_API_VERSION || "2026-01";
-const TARGET = Number(process.env.MONTHLY_TARGET || 120000);
 const ENDPOINT = `https://${SHOP}/admin/api/${VER}/graphql.json`;
 
 const DEADSTOCK_DAYS = 90;      // window for "modal tidur" detection
@@ -276,6 +280,21 @@ async function pullCustomers() {
   }));
 }
 
+// Reads the current month's sales target from the Target card staff drop on
+// the Calendar's Year view (yearlyCards, keyed by "YYYY-MM") — not an env
+// var. Admin SDK bypasses Firestore rules, so this works regardless of who's
+// signed in. Returns 0 if no Target card exists for the current month yet.
+async function getCurrentMonthTarget() {
+  const monthKey = myMonthKey(new Date());
+  const snap = await db.collection("yearlyCards")
+    .where("month", "==", monthKey)
+    .where("cardType", "==", "target")
+    .limit(1)
+    .get();
+  if (snap.empty) return 0;
+  return Number(snap.docs[0].data().targetAmount) || 0;
+}
+
 async function pull() {
   console.log("Fetching products + cost + stock…");
   const variantMap = await pullProducts();
@@ -284,7 +303,10 @@ async function pull() {
   const q = `created_at:>=${daysAgoISO(DEADSTOCK_DAYS)}`;
   const orders = await paginate(Q_ORDERS, (d) => d.orders, { q });
 
-  return { variantMap, orders };
+  const monthlyTarget = await getCurrentMonthTarget();
+  console.log(`Monthly target: ${monthlyTarget ? "RM" + monthlyTarget : "not set for this month"}`);
+
+  return { variantMap, orders, monthlyTarget };
 }
 
 // ---------- compute ----------
@@ -359,7 +381,8 @@ function todayStartUtcISO() {
   return new Date(wallClockUtcMs - MY_OFFSET_MS).toISOString();
 }
 
-function compute({ variantMap, orders }) {
+function compute({ variantMap, orders, monthlyTarget }) {
+  const TARGET = monthlyTarget || 0;
   const now = new Date();
   const nowMy = toMYT(now);
   const todayStr = nowMy.toISOString().slice(0, 10);
@@ -693,7 +716,7 @@ function compute({ variantMap, orders }) {
     mtd: {
       sales: money(mtdSales), orders: mtdOrders,
       aov: mtdOrders ? money(mtdSales / mtdOrders) : 0,
-      target: TARGET, targetPct: money((mtdSales / TARGET) * 100),
+      target: TARGET, targetPct: TARGET ? money((mtdSales / TARGET) * 100) : 0,
       grossProfit: money(grossProfit), margin: money(margin),
       // Order-count based, not $-value based — "N of M orders" is the
       // comparison a director actually reads, not a bare count.
@@ -750,9 +773,11 @@ function computeQuickToday({ created, updated }) {
 
 function buildInsights({ mtdSales, margin, deadStock, stockAlerts, stockOut, target }) {
   const out = [];
-  const pace = (mtdSales / target) * 100;
-  if (pace < 70) out.push(`Sales this month are only ${pace.toFixed(0)}% of the ${rm(target)} target. Needs a push.`);
-  else if (pace >= 100) out.push(`Monthly target reached (${pace.toFixed(0)}%). Great work!`);
+  if (target) {
+    const pace = (mtdSales / target) * 100;
+    if (pace < 70) out.push(`Sales this month are only ${pace.toFixed(0)}% of the ${rm(target)} target. Needs a push.`);
+    else if (pace >= 100) out.push(`Monthly target reached (${pace.toFixed(0)}%). Great work!`);
+  }
   if (margin < 40) out.push(`Margin at ${margin.toFixed(1)}% is low — check discounts or costs.`);
   if (stockOut?.length) {
     const withDemand = stockOut.filter((s) => s.sold30 > 0).length;
@@ -993,7 +1018,7 @@ async function sendEmail(m, yesterday) {
     ``,
     `📊 SALES`,
     `Yesterday (${yesterday.date}): ${rm(yesterday.todaySales)}${changeStr} — ${yesterday.orders} orders`,
-    `This month: ${rm(m.mtd.sales)} / ${rm(m.mtd.target)} (${m.mtd.targetPct}%)`,
+    `This month: ${rm(m.mtd.sales)}${m.mtd.target ? ` / ${rm(m.mtd.target)} (${m.mtd.targetPct}%)` : " (no target set for this month)"}`,
     ``,
     `💰 PROFIT`,
     `Margin: ${m.mtd.margin}%   Gross Profit: ${rm(m.mtd.grossProfit)}`,
