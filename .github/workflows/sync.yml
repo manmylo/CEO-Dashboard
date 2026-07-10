@@ -1,8 +1,6 @@
 name: Gearevo BI sync
 
 on:
-  schedule:
-    - cron: "*/2 * * * *" # GitHub's practical floor is ~5 min regardless — see runbook note below
   workflow_dispatch:
     inputs:
       full:
