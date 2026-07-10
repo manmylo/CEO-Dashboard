@@ -300,7 +300,10 @@ async function pull() {
   const variantMap = await pullProducts();
 
   console.log("Fetching orders (last 90 days)…");
-  const q = `created_at:>=${daysAgoISO(DEADSTOCK_DAYS)}`;
+  // status:any is required — Shopify's Admin API excludes cancelled/closed
+  // orders by default when no status filter is given, which would silently
+  // break the "count cancelled orders, net out via refund" logic below.
+  const q = `created_at:>=${daysAgoISO(DEADSTOCK_DAYS)} status:any`;
   const orders = await paginate(Q_ORDERS, (d) => d.orders, { q });
 
   const monthlyTarget = await getCurrentMonthTarget();
@@ -739,8 +742,8 @@ function compute({ variantMap, orders, monthlyTarget }) {
 async function pullQuickToday() {
   const startIso = todayStartUtcISO();
   console.log(`Quick sync — fetching today's orders (since ${startIso})…`);
-  const created = await paginate(Q_ORDERS_QUICK, (d) => d.orders, { q: `created_at:>=${startIso}` });
-  const updated = await paginate(Q_ORDERS_QUICK, (d) => d.orders, { q: `updated_at:>=${startIso}` });
+  const created = await paginate(Q_ORDERS_QUICK, (d) => d.orders, { q: `created_at:>=${startIso} status:any` });
+  const updated = await paginate(Q_ORDERS_QUICK, (d) => d.orders, { q: `updated_at:>=${startIso} status:any` });
   return { created, updated };
 }
 
