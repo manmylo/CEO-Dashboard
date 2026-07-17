@@ -29,8 +29,9 @@ const TOKEN = process.env.SHOP_TOKEN;
 const VER = process.env.SHOP_API_VERSION || "2026-01";
 const ENDPOINT = `https://${SHOP}/admin/api/${VER}/graphql.json`;
 
-const DEADSTOCK_DAYS = 90;      // window for "modal tidur" detection
-const DEADSTOCK_MIN_UNITS = 5;  // sold <= this in window = suspect
+const ORDER_PULL_DAYS = 90;      // how far back Shopify orders are pulled — margin/products/customers/basket/business-analysis all need this window
+const DEADSTOCK_DAYS = 60;       // window for dead-stock / slow-moving detection ("modal tidur")
+const SLOWMOVING_MAX_UNITS = 5;  // sold 1..N units in DEADSTOCK_DAYS = slow-moving; 0 = dead stock
 const LOW_STOCK_DAYS = 14;      // stockout warning threshold (inclusion cutoff)
 const CRITICAL_STOCK_DAYS = 7;  // <= this many days left = "kritikal" tier, else "amaran"
 const REORDER_LEAD_DAYS = 14;   // assumed supplier lead time for reorder-quantity suggestion
@@ -86,13 +87,19 @@ const db = admin.firestore();
 // safety net so a crashed/killed run (which never reaches the finally block)
 // doesn't permanently wedge every future run.
 const LOCK_STALE_MS = 20 * 60 * 1000; // comfortably longer than a full sync takes
-async function acquireLock() {
+// `force` bypasses the staleness check entirely — for a manually-triggered
+// full sync (FORCE_FULL=true), the person running it already knows they're
+// the only thing running right now, so a leftover lock from an earlier run
+// that crashed before its finally block (workflow cancelled, timeout, OOM)
+// shouldn't block them from re-running immediately instead of waiting out
+// LOCK_STALE_MS.
+async function acquireLock(force) {
   const lockRef = db.doc("sync/lock");
   return db.runTransaction(async (tx) => {
     const snap = await tx.get(lockRef);
     const lockedAt = snap.exists ? snap.data().lockedAt : null;
     const isStale = !lockedAt || (Date.now() - new Date(lockedAt).getTime()) > LOCK_STALE_MS;
-    if (lockedAt && !isStale) return false;
+    if (lockedAt && !isStale && !force) return false;
     tx.set(lockRef, { lockedAt: new Date().toISOString() });
     return true;
   });
@@ -174,6 +181,7 @@ const Q_ORDERS = `
       pageInfo { hasNextPage endCursor }
       nodes {
         id createdAt displayFinancialStatus cancelledAt
+        fulfillments(first: 1) { id }
         totalPriceSet { shopMoney { amount } }
         subtotalPriceSet { shopMoney { amount } }
         totalRefundedSet { shopMoney { amount } }
@@ -289,7 +297,7 @@ async function pull() {
   // status:any is required — Shopify's Admin API excludes cancelled/closed
   // orders by default when no status filter is given, which would silently
   // break the "count cancelled orders" logic below.
-  const q = `created_at:>=${daysAgoISO(DEADSTOCK_DAYS)} status:any`;
+  const q = `created_at:>=${daysAgoISO(ORDER_PULL_DAYS)} status:any`;
   const orders = await paginate(Q_ORDERS, (d) => d.orders, { q });
 
   console.log(`Fetching daily sales history from ${OTHER_PROJECT_ID}...`);
@@ -381,7 +389,6 @@ function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
   const lastMonthKey = `${lmYear}-${String(lmMonth + 1).padStart(2, "0")}`;
 
   let mtdCost = 0;
-  let mtdGrossTotal = 0, mtdRefundTotalOnOrder = 0;
   let refundTotal = 0, grossTotal = 0, cancelledOrders = 0;
   const byRegion = {}, byChannel = {}; // scoped to this month (MTD) — see targetPct-style window below
   // Additional period buckets purely for the Business Analysis concentration
@@ -396,7 +403,7 @@ function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
   // persisted to Firestore's monthly/{month} collection each full sync so
   // months keep their final numbers after they age out of the 90-day window.
   const monthlyOrderStats = {};
-  const soldUnits7 = {}, soldUnits30 = {}, soldUnits90 = {};
+  const soldUnits7 = {}, soldUnits30 = {}, soldUnitsDeadWindow = {}; // soldUnitsDeadWindow = DEADSTOCK_DAYS lookback, for dead-stock/slow-moving
   const profitByProduct = {};    // full 90-day window — dashboard's default "All" view
   const profitByProductMTD = {}; // this month only — used by the email report
   const dailyProductProfit = {}; // { [date]: { [pid]: {title, profit, revenue, units} } } — lets the
@@ -418,13 +425,21 @@ function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
     const ageDays = (now - created) / 864e5;
     grossTotal += total;
     refundTotal += num(o.totalRefundedSet?.shopMoney?.amount);
-    if (o.cancelledAt) cancelledOrders++;
+    // This store also marks genuine post-delivery returns as "cancelled" in
+    // Shopify (not just pre-shipment cancellations), so cancelledAt alone
+    // can't separate the two — fulfillment history can, since it's an
+    // independent, objective fact a later cancellation can't erase.
+    // "Cancelled" = never shipped. "Return" = shipped, then refunded.
+    const shipped = (o.fulfillments || []).length > 0;
+    if (o.cancelledAt && !shipped) cancelledOrders++;
 
     const mstat = monthlyOrderStats[createdMonthKey] || (monthlyOrderStats[createdMonthKey] =
       { month: createdMonthKey, orders: 0, returnOrders: 0, cancelledOrders: 0 });
     mstat.orders++;
-    if (o.cancelledAt) mstat.cancelledOrders++;
-    if ((o.refunds || []).length > 0) mstat.returnOrders++; // "return order" = had at least one refund event, of any kind/reason
+    if (o.cancelledAt && !shipped) mstat.cancelledOrders++;
+    // Shopify also creates a $0 refund record on some cancellations, which
+    // totalRefundedSet > 0 excludes.
+    if (shipped && num(o.totalRefundedSet?.shopMoney?.amount) > 0) mstat.returnOrders++;
 
     const ch = o.channelInformation?.channelDefinition?.channelName || "Other";
     byChannel90d[ch] = (byChannel90d[ch] || 0) + total;
@@ -436,8 +451,6 @@ function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
       const prov = o.shippingAddress?.province || "Unknown";
       byRegion[prov] = (byRegion[prov] || 0) + total;
       byChannel[ch] = (byChannel[ch] || 0) + total;
-      mtdGrossTotal += total;
-      mtdRefundTotalOnOrder += num(o.totalRefundedSet?.shopMoney?.amount);
       if (custId) customerRevMTD[custId] = (customerRevMTD[custId] || 0) + subtotal;
     } else if (createdMonthKey === lastMonthKey) {
       byChannelLastMonth[ch] = (byChannelLastMonth[ch] || 0) + total;
@@ -457,7 +470,7 @@ function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
       if (vid) {
         if (ageDays <= 7) soldUnits7[vid] = (soldUnits7[vid] || 0) + qty;
         if (ageDays <= 30) soldUnits30[vid] = (soldUnits30[vid] || 0) + qty;
-        soldUnits90[vid] = (soldUnits90[vid] || 0) + qty;
+        if (ageDays <= DEADSTOCK_DAYS) soldUnitsDeadWindow[vid] = (soldUnitsDeadWindow[vid] || 0) + qty;
       }
 
       const pid = v?.productId || li.product?.id || li.product?.title || "unknown";
@@ -575,12 +588,10 @@ function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
   const margin = mtdSales ? (grossProfit / mtdSales) * 100 : 0;
   const returnsRate = grossTotal ? (refundTotal / grossTotal) * 100 : 0; // 90-day, value-based — kept for AI context
 
-  // This month's return/cancellation stats, order-count based (not $ value) —
-  // "3 of 205 orders" is the comparison a director actually reads, not a bare "3".
-  const currentMonthOrderStats = monthlyOrderStats[monthKey] || { orders: 0, returnOrders: 0, cancelledOrders: 0 };
-  const mtdReturnsRate = mtdGrossTotal ? (mtdRefundTotalOnOrder / mtdGrossTotal) * 100 : 0;
-  const mtdCancelledRate = currentMonthOrderStats.orders
-    ? (currentMonthOrderStats.cancelledOrders / currentMonthOrderStats.orders) * 100 : 0;
+  // This month's Returns %/Cancelled % KPI cards are now live off the Worker
+  // (see app.js's loadMonthOrderSummary) — no MTD returns/cancelled fields
+  // computed here anymore. monthlyOrderStats itself is still needed below for
+  // monthlyOrderTrend (the Business Analysis chart's per-month history).
   const monthlyOrderTrend = Object.values(monthlyOrderStats).sort((a, b) => a.month.localeCompare(b.month));
 
   const rankProducts = (byProduct) => Object.values(byProduct)
@@ -639,14 +650,20 @@ function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
     },
   };
 
-  const deadStock = [], stockAlerts = [], stockOut = [];
+  const deadStock = [], slowMoving = [], stockAlerts = [], stockOut = [];
   for (const [vid, v] of variantMap) {
-    const sold90 = soldUnits90[vid] || 0;
+    const soldDeadWindow = soldUnitsDeadWindow[vid] || 0; // units sold in the last DEADSTOCK_DAYS
     const sold30 = soldUnits30[vid] || 0;
     const sold7 = soldUnits7[vid] || 0;
-    if (v.inventory > 0 && sold90 <= DEADSTOCK_MIN_UNITS) {
+    // Dead stock = zero sales in the window. Slow moving = it did sell, just
+    // barely (1..SLOWMOVING_MAX_UNITS) — a distinct, less urgent tier from
+    // genuinely dead stock, not lumped into the same list.
+    if (v.inventory > 0 && soldDeadWindow === 0) {
       deadStock.push({ title: v.productTitle, sku: v.sku, onHand: v.inventory,
-        capital: money(v.inventory * v.cost), sold90d: sold90 });
+        capital: money(v.inventory * v.cost), sold60: soldDeadWindow });
+    } else if (v.inventory > 0 && soldDeadWindow <= SLOWMOVING_MAX_UNITS) {
+      slowMoving.push({ title: v.productTitle, sku: v.sku, onHand: v.inventory,
+        capital: money(v.inventory * v.cost), sold60: soldDeadWindow });
     }
 
     const velocity7 = sold7 / 7;
@@ -693,6 +710,7 @@ function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
     }
   }
   deadStock.sort((a, b) => b.capital - a.capital);
+  slowMoving.sort((a, b) => b.capital - a.capital);
   stockAlerts.sort((a, b) => a.daysLeft - b.daysLeft);
   // Most in-demand out-of-stock items first — that's the real restock priority
   // once something's already at zero, not how far negative it happens to be.
@@ -712,14 +730,10 @@ function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
       aov: mtdOrders ? money(mtdSales / mtdOrders) : 0,
       target: TARGET, targetPct: TARGET ? money((mtdSales / TARGET) * 100) : 0,
       grossProfit: money(grossProfit), margin: money(margin),
-      // Order-count based, not $-value based — "N of M orders" is the
-      // comparison a director actually reads, not a bare count.
-      returnsRate: money(mtdReturnsRate), returnOrders: currentMonthOrderStats.returnOrders,
-      cancelledOrders: currentMonthOrderStats.cancelledOrders, cancelledRate: money(mtdCancelledRate),
     },
     returnsRate: money(returnsRate), cancelledOrders, // 90-day, kept for the AI insights context only
     topProducts, topProductsMTD, totalProfit90: money(totalProfit90), // topProducts = full 90-day window (dashboard default); MTD = email only
-    deadStock, stockAlerts: stockAlerts.slice(0, 20),
+    deadStock, slowMoving, stockAlerts: stockAlerts.slice(0, 20),
     stockOut, // deadStock/stockOut unsliced — dashboard shows first 20 with a "see more" toggle for the rest
     basketAnalysis, // "frequently bought together" — top pairs by lift, 90-day window
     byRegion, byChannel, // both scoped to this month (MTD) — same window as mtd.sales
@@ -1321,7 +1335,8 @@ async function sendDailyEmailIfDue(freshMetrics, force) {
 
 // ---------- main ----------
 (async () => {
-  const gotLock = await acquireLock();
+  const forceFull = process.env.FORCE_FULL === "true";
+  const gotLock = await acquireLock(forceFull);
   if (!gotLock) {
     console.log("Another sync run is already in progress — skipping this run (no lock, no Shopify calls, no writes).");
     return;
@@ -1337,7 +1352,6 @@ async function sendDailyEmailIfDue(freshMetrics, force) {
       return;
     }
 
-    const forceFull = process.env.FORCE_FULL === "true";
     const forceEmail = process.env.FORCE_EMAIL === "true";
     const todayStr = myDateStr(new Date());
 

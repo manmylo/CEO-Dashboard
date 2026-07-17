@@ -16,6 +16,22 @@ on:
         type: boolean
         default: false
 
+# Triggered every ~2 min by an external cron (cron-job.org) — without this,
+# a run that gets cancelled or killed mid-flight (GitHub concurrent-job
+# limits, manual cancellation, etc.) leaves sync.js's own Firestore lock
+# stuck, since a cancelled run never reaches the code that releases it.
+# Every run for the next ~20 minutes then just silently no-ops against that
+# stuck lock — reported as a misleading "success" in the Actions UI, since
+# a graceful skip isn't a script error. This queues overlapping triggers
+# instead: only one run is ever in flight, so nothing gets cancelled out
+# from under an in-progress sync. If more triggers pile up while one run is
+# already queued, only the newest queued one survives (the older, not-yet-
+# started ones are superseded) — that's fine, since a not-yet-started run
+# never held the Firestore lock to begin with.
+concurrency:
+  group: gearevo-sync
+  cancel-in-progress: false
+
 jobs:
   sync:
     runs-on: ubuntu-latest

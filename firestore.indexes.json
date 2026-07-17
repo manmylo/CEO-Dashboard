@@ -1,0 +1,13 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "calendarCards",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "cardType", "order": "ASCENDING" },
+        { "fieldPath": "date", "order": "ASCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}
