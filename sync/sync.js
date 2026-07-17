@@ -787,20 +787,6 @@ async function fetchAllDailySalesFromDashboard() {
   return map;
 }
 
-async function pullTodayFromOtherProject() {
-  const url = `https://firestore.googleapis.com/v1/projects/${OTHER_PROJECT_ID}/databases/(default)/documents/sales/today`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Sales dashboard fetch failed: ${res.status}`);
-  const body = await res.json();
-  const fields = body.fields || {};
-  const numField = (k) => Number(fields[k]?.doubleValue ?? fields[k]?.integerValue ?? 0);
-  return {
-    date: myDateStr(new Date()),
-    generatedAt: new Date().toISOString(),
-    today: { sales: money(numField("currentSale")), orders: numField("totalOrders") },
-  };
-}
-
 function buildInsights({ mtdSales, margin, deadStock, stockAlerts, stockOut, target }) {
   const out = [];
   if (target) {
@@ -906,7 +892,11 @@ async function generateAIInsights(context) {
     const anthropic = new Anthropic();
     const response = await anthropic.messages.create({
       model: "claude-opus-4-8",
-      max_tokens: 1024,
+      // 1024 was too tight once thinking tokens (adaptive) share this same
+      // budget — could truncate the JSON output mid-string before it
+      // finished (same failure mode already fixed in generateStrategicAnalysis
+      // below by raising its max_tokens; applying the same fix here).
+      max_tokens: 4096,
       thinking: { type: "adaptive" },
       system: `You are a business advisor (Chief Data Officer) for Gearevo, a knife/gear retailer in Malaysia selling through Shopify, Shopee, and TikTok Shop.
 
@@ -1243,45 +1233,21 @@ async function runBackfillFromDashboard() {
   return null;
 }
 
+// Today's Sales/Sales This Month/Order Count (app.js's direct live listener
+// on the Gearevo sales dashboard's own Firestore) and Returns/Cancelled/
+// Gross Profit (fetched live from the Worker) are no longer relayed through
+// here at all — both already read live from their real source, so writing a
+// second, slower-to-update copy into dashboard/latest would just be a
+// redundant, potentially-conflicting shadow of data that's already correct
+// elsewhere. Quick sync now does the one thing nothing else covers: live
+// inventory value, which only a Shopify products pull can compute. The
+// monthly target is also not fetched here — the dashboard reads the Target
+// card straight from Firestore itself (live onSnapshot listener).
 async function runQuick() {
-  // Today's sales figure comes from the Gearevo sales dashboard's own
-  // Firestore now (see pullTodayFromOtherProject above), not a second
-  // Shopify fetch — if that read fails, the whole run is skipped rather
-  // than falling back to a fetch that could independently drift again.
-  // Products/inventory (always live, not tied to the 90-day order window)
-  // still refresh every quick run. The monthly target is NOT fetched here —
-  // the dashboard reads the Target card straight from Firestore itself
-  // (live onSnapshot listener), updating instantly with no sync round-trip.
-  let q;
-  try {
-    q = await pullTodayFromOtherProject();
-  } catch (err) {
-    console.log(`Quick sync — skipped (sales dashboard read failed: ${err.message}).`);
-    return null;
-  }
   const variantMap = await pullProducts();
   const inv = computeInventory(variantMap);
-
-  // dashboard/latest always gets a fresh write — Firestore bills per document
-  // touched, not per field, so writing every run costs exactly the same as
-  // writing conditionally, and it keeps "last synced" honest (a stale stamp
-  // otherwise looks indistinguishable from a broken/skipped run). The one
-  // write that's actually worth skipping is the separate daily/{date} doc,
-  // since that's a second, genuinely avoidable write when nothing sold.
-  const prevSnap = await db.doc("dashboard/latest").get();
-  const prev = prevSnap.exists ? prevSnap.data() : {};
-  const salesChanged = prev.today?.sales !== q.today.sales || prev.today?.orders !== q.today.orders;
-
-  const batch = db.batch();
-  batch.set(db.doc("dashboard/latest"),
-    { date: q.date, generatedAt: q.generatedAt, today: q.today, ...inv }, { merge: true });
-  if (salesChanged) {
-    batch.set(db.doc(`daily/${q.date}`),
-      { date: q.date, todaySales: q.today.sales, orders: q.today.orders }, { merge: true });
-  }
-  await batch.commit();
-  console.log(`Quick sync — today RM${q.today.sales} (${q.today.orders} orders), `
-    + `inventory RM${inv.endingInventoryRetailValue}${salesChanged ? "" : " (sales unchanged, daily doc write skipped)"}.`);
+  await db.doc("dashboard/latest").set(inv, { merge: true });
+  console.log(`Quick sync — inventory RM${inv.endingInventoryRetailValue}.`);
   return null;
 }
 
