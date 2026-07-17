@@ -13,10 +13,10 @@
  *   ANTHROPIC_API_KEY (optional — AI-generated advisor insights; falls back to
  *   rule-based buildInsights() if unset or the call fails)
  *
- * The monthly sales target is set by staff via a Target card dropped on the
- * current month in the dashboard's Calendar (Year view) — sync.js doesn't
- * fetch or relay it at all; the dashboard reads it live, directly, via its
- * own Firestore listener on that card.
+ * The monthly sales target is NOT an env var — it's set by staff via a
+ * Target card dropped on the current month in the dashboard's Calendar
+ * (Year view). See getCurrentMonthTarget() below. If no Target card exists
+ * for the current month, target is 0 and the dashboard shows "no target set".
  */
 
 import admin from "firebase-admin";
@@ -270,6 +270,21 @@ async function pullCustomers() {
   }));
 }
 
+// Reads the current month's sales target from the Target card staff drop on
+// the Calendar's Year view (yearlyCards, keyed by "YYYY-MM") — not an env
+// var. Admin SDK bypasses Firestore rules, so this works regardless of who's
+// signed in. Returns 0 if no Target card exists for the current month yet.
+async function getCurrentMonthTarget() {
+  const monthKey = myMonthKey(new Date());
+  const snap = await db.collection("yearlyCards")
+    .where("month", "==", monthKey)
+    .where("cardType", "==", "target")
+    .limit(1)
+    .get();
+  if (snap.empty) return 0;
+  return Number(snap.docs[0].data().targetAmount) || 0;
+}
+
 async function pull() {
   console.log("Fetching products + cost + stock…");
   const variantMap = await pullProducts();
@@ -289,7 +304,10 @@ async function pull() {
   const dashboardDaily = await fetchAllDailySalesFromDashboard();
   console.log(`Sales dashboard — ${dashboardDaily.size} days of history.`);
 
-  return { variantMap, orders, dashboardDaily };
+  const monthlyTarget = await getCurrentMonthTarget();
+  console.log(`Monthly target: ${monthlyTarget ? "RM" + monthlyTarget : "not set for this month"}`);
+
+  return { variantMap, orders, monthlyTarget, dashboardDaily };
 }
 
 // ---------- compute ----------
@@ -357,7 +375,8 @@ function myDateStr(dateInput) { return toMYT(dateInput).toISOString().slice(0, 1
 function myMonthKey(dateInput) { return toMYT(dateInput).toISOString().slice(0, 7); }
 function myYesterdayStr() { return myDateStr(new Date(Date.now() - 24 * 60 * 60 * 1000)); }
 
-function compute({ variantMap, orders, dashboardDaily }) {
+function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
+  const TARGET = monthlyTarget || 0;
   const now = new Date();
   const nowMy = toMYT(now);
   const todayStr = nowMy.toISOString().slice(0, 10);
@@ -704,10 +723,12 @@ function compute({ variantMap, orders, dashboardDaily }) {
     yesterday: { sales: money(yesterdaySales), orders: yesterdayOrders }, // AI advisor context only
     mtdThroughYesterday: {
       sales: money(mtdSalesThroughYesterday), orders: mtdOrdersThroughYesterday,
+      target: TARGET, targetPct: TARGET ? money((mtdSalesThroughYesterday / TARGET) * 100) : 0,
     }, // AI advisor context only — see note above mtdSalesThroughYesterday
     mtd: {
       sales: money(mtdSales), orders: mtdOrders,
       aov: mtdOrders ? money(mtdSales / mtdOrders) : 0,
+      target: TARGET, targetPct: TARGET ? money((mtdSales / TARGET) * 100) : 0,
       grossProfit: money(grossProfit), margin: money(margin),
     },
     returnsRate: money(returnsRate), cancelledOrders, // 90-day, kept for the AI insights context only
@@ -718,7 +739,7 @@ function compute({ variantMap, orders, dashboardDaily }) {
     byRegion, byChannel, // both scoped to this month (MTD) — same window as mtd.sales
     ...computeInventory(variantMap),
     dailyTrend, monthlyOrderTrend, concentrationByPeriod, // all merged into businessAnalysis in runFull(), not written to dashboard/latest directly
-    insights: buildInsights({ margin, deadStock, stockAlerts, stockOut }),
+    insights: buildInsights({ mtdSales, margin, deadStock, stockAlerts, stockOut, target: TARGET }),
   };
 }
 
@@ -766,8 +787,13 @@ async function fetchAllDailySalesFromDashboard() {
   return map;
 }
 
-function buildInsights({ margin, deadStock, stockAlerts, stockOut }) {
+function buildInsights({ mtdSales, margin, deadStock, stockAlerts, stockOut, target }) {
   const out = [];
+  if (target) {
+    const pace = (mtdSales / target) * 100;
+    if (pace < 70) out.push(`Sales this month are only ${pace.toFixed(0)}% of the ${rm(target)} target. Needs a push.`);
+    else if (pace >= 100) out.push(`Monthly target reached (${pace.toFixed(0)}%). Great work!`);
+  }
   if (margin < 40) out.push(`Margin at ${margin.toFixed(1)}% is low — check discounts or costs.`);
   if (stockOut?.length) {
     const withDemand = stockOut.filter((s) => s.sold30 > 0).length;
@@ -876,7 +902,7 @@ async function generateAIInsights(context) {
 
 ${BUSINESS_CONTEXT}
 
-Write 3-6 concise observations in plain business English, in the same style as: "Margin dropped to 32% this month — check discounts or product costs."
+Write 3-6 concise observations in plain business English, in the same style as: "Sales this month are only 45% of the RM120,000 target. Needs a push."
 
 Strict rules:
 - Only use the numbers given below. DO NOT invent figures, trends, or product names that aren't in the data.
@@ -1013,7 +1039,7 @@ async function sendEmail(m, yesterday) {
     ``,
     `📊 SALES`,
     `Yesterday (${yesterday.date}): ${rm(yesterday.todaySales)}${changeStr} — ${yesterday.orders} orders`,
-    `This month: ${rm(m.mtd.sales)}`,
+    `This month: ${rm(m.mtd.sales)}${m.mtd.target ? ` / ${rm(m.mtd.target)} (${m.mtd.targetPct}%)` : " (no target set for this month)"}`,
     ``,
     `💰 PROFIT`,
     `Margin: ${m.mtd.margin}%   Gross Profit: ${rm(m.mtd.grossProfit)}`,
