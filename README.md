@@ -167,12 +167,16 @@ node --env-file=.env sync.js
 
 ## Excluded SKUs
 
-`sync/excluded-skus.js` lists service / add-on SKUs (Sharpening, Engraving, Kydex,
-etc.) plus the `GE-OID-1`…`GE-OID-100` range. These are dropped from **product
-analytics** (top products, profit, dead stock, slow moving, stock alerts, velocity) so services
-don't pollute the numbers with fake 100% margins. They are **still counted in total
-sales / order counts** because that's real revenue. To exclude more later, just add
-the SKU string to `SERVICE_SKUS` in that file.
+`sync/excluded-skus.js` lists service / add-on SKUs, each tagged with a category
+(Sharpening, Sharpening Add-on, Engraving, Engraving Add-on, Kydex, Kydex Add-on)
+plus the `GE-OID-1`…`GE-OID-100` range (no category, just excluded). These are
+dropped from **product analytics** (top products, profit, dead stock, slow moving,
+stock alerts, velocity) so services don't pollute the numbers with fake 100%
+margins. They are **still counted in total sales / order counts** because that's
+real revenue, and their own units/revenue are tracked separately on the **Services**
+card, grouped by category. To exclude more later, add the SKU with its category to
+`SERVICE_SKU_CATEGORY` in that file (a title-prefix fallback also exists for
+variants not yet added — see `SERVICE_TITLE_PREFIXES`/`isExcludedTitle`).
 
 ## Tuning
 

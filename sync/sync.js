@@ -21,7 +21,7 @@
 
 import admin from "firebase-admin";
 import Anthropic from "@anthropic-ai/sdk";
-import { isExcluded, isExcludedTitle } from "./excluded-skus.js";
+import { isExcluded, isExcludedTitle, getServiceCategory } from "./excluded-skus.js";
 
 // ---------- config ----------
 const SHOP = process.env.SHOP_DOMAIN;
@@ -525,6 +525,12 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
   const soldUnits7 = {}, soldUnits30 = {}, soldUnits90 = {}; // 7/30 feed the DSI velocity blend; 90 gates dead-stock candidacy/slow-moving
   const profitByProduct = {};    // full 90-day window — dashboard's default "All" view
   const profitByProductMTD = {}; // this month only — used by the email report
+  // Services (Sharpening/Engraving/Kydex/etc.) are excluded from all product
+  // analytics above (no meaningful "Cost per item" in Shopify for a service,
+  // so profit/margin would be fake) — tracked here instead, by category, full
+  // 90-day window. Revenue-only, matching the order-level totals' own
+  // convention of counting this money as real, just not product-level profit.
+  const serviceStats = {};
   const dailyProductProfit = {}; // { [date]: { [pid]: {title, profit, revenue, units} } } — lets the
                                   // dashboard's "date range" filter aggregate any custom range client-side
   // Basket analysis ("frequently bought together") — pair co-occurrence counts
@@ -578,7 +584,16 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
 
     const basketSet = new Set(); // distinct qualifying pids in this order — see basket tally below
     for (const li of o.lineItems?.nodes || []) {
-      if (isExcluded(li.sku) || isExcludedTitle(li.product?.title)) continue; // exclude services from product analytics
+      if (isExcluded(li.sku) || isExcludedTitle(li.product?.title)) {
+        // Excluded from all product analytics below — tracked here instead,
+        // by category (falls back to "Other Services" if a title-matched
+        // item has no explicit SKU category yet).
+        const category = getServiceCategory(li.sku) || "Other Services";
+        const stat = serviceStats[category] || (serviceStats[category] = { category, units: 0, revenue: 0 });
+        stat.units += num(li.quantity);
+        stat.revenue += num(li.discountedTotalSet?.shopMoney?.amount);
+        continue;
+      }
       const vid = li.variant?.id;
       const v = vid ? variantMap.get(vid) : null;
       const qty = num(li.quantity);
@@ -706,6 +721,15 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
   const grossProfit = mtdSales - mtdCost;
   const margin = mtdSales ? (grossProfit / mtdSales) * 100 : 0;
   const returnsRate = grossTotal ? (refundTotal / grossTotal) * 100 : 0; // 90-day, value-based — kept for AI context
+
+  const totalServiceRevenue = Object.values(serviceStats).reduce((s, c) => s + c.revenue, 0);
+  const services = Object.values(serviceStats)
+    .map((c) => ({
+      category: c.category, units: c.units, revenue: money(c.revenue),
+      avgPrice: c.units ? money(c.revenue / c.units) : 0,
+      pctOfSales: grossTotal ? money((c.revenue / grossTotal) * 100) : 0,
+    }))
+    .sort((a, b) => b.revenue - a.revenue);
 
   // This month's Returns %/Cancelled % KPI cards are now live off the Worker
   // (see app.js's loadMonthOrderSummary) — no MTD returns/cancelled fields
@@ -882,6 +906,7 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
     topProducts, topProductsMTD, totalProfit90: money(totalProfit90), // topProducts = full 90-day window (dashboard default); MTD = email only
     deadStock, slowMoving, stockAlerts: stockAlerts.slice(0, 20),
     stockOut, // deadStock/stockOut unsliced — dashboard shows first 20 with a "see more" toggle for the rest
+    services, servicesTotal: { revenue: money(totalServiceRevenue), pctOfSales: grossTotal ? money((totalServiceRevenue / grossTotal) * 100) : 0 },
     basketAnalysis, // "frequently bought together" — top pairs by lift, 90-day window
     byRegion, byChannel, // both scoped to this month (MTD) — same window as mtd.sales
     ...computeInventory(variantMap),
