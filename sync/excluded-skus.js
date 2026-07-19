@@ -74,3 +74,23 @@ export function isExcluded(sku) {
   if (m) { const n = Number(m[1]); return n >= 1 && n <= 100; }
   return false;
 }
+
+// Some services are sold under many size/finish/tier variants that don't
+// share individual SKU codes worth listing one by one (e.g. "Servis Asah
+// Pisau (Mirror Finish - Bilah 10-14 Inci)" vs "... (Re-Profile - Bilah
+// 10-14 Inci)", or "LASER ENGRAVING - 1ST TO 3RD KNIFE" vs "LASER ENGRAVING
+// SERVICE - 4TH TO 50TH KNIFE SAME NAME") -- excluded by TITLE PREFIX
+// instead, case-insensitive. Same treatment as excluded SKUs above: these
+// are services, always "available" regardless of any on-hand count, so they
+// shouldn't show up as dead/slow-moving/low/out-of-stock, or skew inventory
+// value or profit rankings.
+export const SERVICE_TITLE_PREFIXES = [
+  "Servis Asah Pisau",
+  "LASER ENGRAVING",
+];
+
+export function isExcludedTitle(title) {
+  if (!title) return false;
+  const t = title.toUpperCase();
+  return SERVICE_TITLE_PREFIXES.some((p) => t.startsWith(p.toUpperCase()));
+}

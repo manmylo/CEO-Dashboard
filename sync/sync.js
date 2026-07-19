@@ -21,7 +21,7 @@
 
 import admin from "firebase-admin";
 import Anthropic from "@anthropic-ai/sdk";
-import { isExcluded } from "./excluded-skus.js";
+import { isExcluded, isExcludedTitle } from "./excluded-skus.js";
 
 // ---------- config ----------
 const SHOP = process.env.SHOP_DOMAIN;
@@ -258,7 +258,7 @@ async function pullProducts() {
   const variantMap = new Map();
   for (const p of products) {
     for (const v of p.variants.nodes) {
-      if (isExcluded(v.sku)) continue; // services/add-ons: not stock items
+      if (isExcluded(v.sku) || isExcludedTitle(p.title)) continue; // services/add-ons: not stock items
       variantMap.set(v.id, {
         productId: p.id,
         productTitle: p.title,
@@ -578,7 +578,7 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
 
     const basketSet = new Set(); // distinct qualifying pids in this order — see basket tally below
     for (const li of o.lineItems?.nodes || []) {
-      if (isExcluded(li.sku)) continue; // exclude services from product analytics
+      if (isExcluded(li.sku) || isExcludedTitle(li.product?.title)) continue; // exclude services from product analytics
       const vid = li.variant?.id;
       const v = vid ? variantMap.get(vid) : null;
       const qty = num(li.quantity);
