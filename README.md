@@ -179,10 +179,21 @@ the SKU string to `SERVICE_SKUS` in that file.
 In `sync/sync.js` top constants:
 - `ORDER_PULL_DAYS` — how far back Shopify orders are pulled each sync (margin/
   products/customers/basket analysis/Business Analysis all need this window).
-- `DEADSTOCK_DAYS` — the lookback window for "modal tidur" detection specifically
-  (dead stock / slow moving), separate from `ORDER_PULL_DAYS` above.
-- `SLOWMOVING_MAX_UNITS` — a SKU with stock on hand and **0** units sold in
-  `DEADSTOCK_DAYS` is dead stock; 1..`SLOWMOVING_MAX_UNITS` is slow moving instead.
+- `SLOWMOVING_DSI_DAYS` — slow moving uses DSI (Days Sales of Inventory: on-hand
+  units ÷ the same weighted 7/30-day velocity the stockout forecast already
+  computes) rather than a flat units-sold count, so severity scales with how
+  much stock is actually sitting there. A SKU that did sell but would take more
+  than `SLOWMOVING_DSI_DAYS` (90, matching `DEADSTOCK_WINDOW_DAYS` below on
+  purpose — one consistent 90-day standard) to clear at its current pace is
+  slow moving.
+- `DEADSTOCK_WINDOW_DAYS` / `RESTOCK_LOOKBACK_DAYS` — dead stock ("modal tidur")
+  is anchored to each SKU's own last-restocked date, not a shared window from
+  today: 0 units sold in `DEADSTOCK_WINDOW_DAYS` (90) since it was last
+  restocked. Restock date comes from ShopifyQL's `inventory_adjustment_history`
+  (a real Purchase Order "Shipment received" event if one exists, else a manual
+  adjustment that took the SKU from 0 to positive stock, else unknown/">180d"
+  if nothing shows up within `RESTOCK_LOOKBACK_DAYS` — Shopify's own hard cap
+  on how far back that history is queryable). See `getRestockDates()`.
 - `LOW_STOCK_DAYS` — stockout warning threshold.
 - Channel split uses `order.source_name` — depends on how your Shopee/TikTok
   sync app tags orders; adjust the mapping if the labels look off.

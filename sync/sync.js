@@ -30,8 +30,26 @@ const VER = process.env.SHOP_API_VERSION || "2026-01";
 const ENDPOINT = `https://${SHOP}/admin/api/${VER}/graphql.json`;
 
 const ORDER_PULL_DAYS = 90;      // how far back Shopify orders are pulled — margin/products/customers/basket/business-analysis all need this window
-const DEADSTOCK_DAYS = 60;       // window for dead-stock / slow-moving detection ("modal tidur")
-const SLOWMOVING_MAX_UNITS = 5;  // sold 1..N units in DEADSTOCK_DAYS = slow-moving; 0 = dead stock
+// Slow moving uses DSI (Days Sales of Inventory) — on-hand units divided by
+// the same weighted 7/30-day velocity the stockout forecast already computes
+// (0.6 * 7-day rate + 0.4 * 30-day rate), giving "estimated days to sell
+// through current stock at the current pace." SLOWMOVING_DSI_DAYS matches
+// DEADSTOCK_WINDOW_DAYS below on purpose — the two are meant to be one
+// consistent 90-day standard: DSI > 90 = slow moving (it did sell, just too
+// slowly to clear in that timeframe); 0 sold at all within 90 days of
+// restock = dead stock. DSI can't apply to a SKU with 0 velocity (divide by
+// zero) — that's exactly why dead stock stays its own separate 0-sold rule.
+const SLOWMOVING_DSI_DAYS = 90;
+// Dead stock ("modal tidur") is anchored to each SKU's own restock date, not a
+// shared rolling window from today — see getRestockDates()/classifyDeadStock().
+// DEADSTOCK_WINDOW_DAYS = must have 0 sales in this many days since restock
+// (or since today, if no restock event is found at all) to count as dead.
+// RESTOCK_LOOKBACK_DAYS = Shopify's own hard cap on how far back
+// inventory_adjustment_history is queryable — can't see further than this,
+// so a SKU with no visible restock event beyond this window just falls back
+// to "0 sold in DEADSTOCK_WINDOW_DAYS from today," same as before.
+const DEADSTOCK_WINDOW_DAYS = 90;
+const RESTOCK_LOOKBACK_DAYS = 180;
 const LOW_STOCK_DAYS = 14;      // stockout warning threshold (inclusion cutoff)
 const CRITICAL_STOCK_DAYS = 7;  // <= this many days left = "kritikal" tier, else "amaran"
 const REORDER_LEAD_DAYS = 14;   // assumed supplier lead time for reorder-quantity suggestion
@@ -364,6 +382,107 @@ function computeCustomerSegments(customers) {
   return { vip, atRisk, newThisMonth, top5RevenuePct, totalCustomers: customers.length };
 }
 
+// ---------- dead-stock restock-date lookup ----------
+// Shopify has no "last restocked" field anywhere — the only way to derive
+// one is ShopifyQL's inventory_adjustment_history dataset, which tracks
+// daily inventory changes per SKU with a reference_document_type:
+//   "Inventory::PurchaseOrder" — a real Shipment Received event (confirmed
+//     against live store data: this store started using Purchase Orders in
+//     April 2026, so this is the reliable signal for anything since then).
+//   null — no linked document, i.e. a manual quantity edit in the Admin.
+//     Used as a fallback restock signal for pre-April stock that predates
+//     the PO workflow: specifically, a manual adjustment that takes the
+//     running on-hand balance from <=0 up to a positive number (a genuine
+//     "back in stock" event), not just any manual tweak/correction.
+// Only queried for dead-stock CANDIDATES (already known to have 0 sales in
+// DEADSTOCK_WINDOW_DAYS from today), not the whole catalog — shopifyqlQuery
+// has no pagination, so an unscoped store-wide query risks silent
+// truncation; scoping to a WHERE...IN list of specific SKUs keeps each
+// query small and complete. Shopify's own hard cap on how far back this
+// data exists is RESTOCK_LOOKBACK_DAYS (180) — a SKU with no visible
+// restock event at all in that window returns { date: null }, meaning
+// "unknown, or genuinely more than 180 days ago" (displayed as ">180d").
+const RESTOCK_QUERY_CHUNK = 50; // SKUs per ShopifyQL call
+async function getRestockDates(candidates) {
+  const results = new Map(); // sku -> { date: "YYYY-MM-DD" | null }
+  const onHandBySku = new Map(candidates.map((c) => [c.sku, c.onHand]));
+  const skus = candidates.map((c) => c.sku).filter(Boolean);
+
+  for (let i = 0; i < skus.length; i += RESTOCK_QUERY_CHUNK) {
+    const chunk = skus.slice(i, i + RESTOCK_QUERY_CHUNK);
+    const skuList = chunk.map((s) => `'${s.replace(/'/g, "\\'")}'`).join(", ");
+    const ql = `FROM inventory_adjustment_history SHOW inventory_adjustment_change `
+      + `GROUP BY day, product_variant_sku, reference_document_type `
+      + `WHERE product_variant_sku IN (${skuList}) `
+      + `SINCE -${RESTOCK_LOOKBACK_DAYS}d UNTIL today ORDER BY day ASC`;
+
+    let data;
+    try {
+      data = await graphql(
+        `query($q: String!) { shopifyqlQuery(query: $q) { tableData { rows } parseErrors } }`,
+        { q: ql }
+      );
+    } catch (e) {
+      console.log(`Restock-date lookup failed for a chunk, treating as unknown: ${e.message}`);
+      for (const sku of chunk) results.set(sku, { date: null });
+      continue;
+    }
+    const result = data.shopifyqlQuery;
+    if (result?.parseErrors?.length) {
+      console.log(`Restock-date lookup — ShopifyQL parse error: ${JSON.stringify(result.parseErrors)}`);
+      for (const sku of chunk) results.set(sku, { date: null });
+      continue;
+    }
+
+    // Group by SKU, then by day, summing every type's change that day (needed
+    // for accurate running-balance reconstruction) while separately flagging
+    // days that had a PO-linked or manual positive delta.
+    const bySku = new Map();
+    for (const r of result?.tableData?.rows || []) {
+      const sku = r.product_variant_sku;
+      if (!sku) continue;
+      const perDay = bySku.get(sku) || bySku.set(sku, new Map()).get(sku);
+      const day = perDay.get(r.day) || perDay.set(r.day, { total: 0, poPositive: false, manualPositive: false }).get(r.day);
+      const change = Number(r.inventory_adjustment_change || 0);
+      day.total += change;
+      if (r.reference_document_type === "Inventory::PurchaseOrder" && change > 0) day.poPositive = true;
+      if (r.reference_document_type == null && change > 0) day.manualPositive = true;
+    }
+
+    for (const sku of chunk) {
+      const perDay = bySku.get(sku);
+      if (!perDay || !perDay.size) { results.set(sku, { date: null }); continue; }
+      const days = [...perDay.keys()].sort(); // "YYYY-MM-DD" strings sort chronologically
+
+      // Tier 1: most recent PO-linked positive day — unambiguous on its own,
+      // no balance reconstruction needed.
+      let tier1Date = null;
+      for (const d of days) if (perDay.get(d).poPositive) tier1Date = d; // ascending order, last match wins
+      if (tier1Date) { results.set(sku, { date: tier1Date }); continue; }
+
+      // Tier 2: most recent manual adjustment that crossed the running
+      // balance from <=0 to >0. Reconstructed by walking forward from a
+      // start-of-window balance derived from today's live on-hand quantity
+      // minus the window's total net change (no absolute balance is directly
+      // queryable — only daily deltas — so this is the only way to know what
+      // the balance was on any given day in the window).
+      const onHand = onHandBySku.get(sku);
+      let tier2Date = null;
+      if (onHand != null) {
+        const totalWindowDelta = days.reduce((s, d) => s + perDay.get(d).total, 0);
+        let balance = onHand - totalWindowDelta;
+        for (const d of days) {
+          const before = balance;
+          balance += perDay.get(d).total;
+          if (perDay.get(d).manualPositive && before <= 0 && balance > 0) tier2Date = d;
+        }
+      }
+      results.set(sku, { date: tier2Date });
+    }
+  }
+  return results;
+}
+
 // ---------- Malaysia timezone (UTC+8) helpers ----------
 // Net sales matches Shopify Analytics:
 //   • sales (subtotal after discount) counted on the ORDER's created date (MYT)
@@ -375,7 +494,7 @@ function myDateStr(dateInput) { return toMYT(dateInput).toISOString().slice(0, 1
 function myMonthKey(dateInput) { return toMYT(dateInput).toISOString().slice(0, 7); }
 function myYesterdayStr() { return myDateStr(new Date(Date.now() - 24 * 60 * 60 * 1000)); }
 
-function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
+async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
   const TARGET = monthlyTarget || 0;
   const now = new Date();
   const nowMy = toMYT(now);
@@ -403,7 +522,7 @@ function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
   // persisted to Firestore's monthly/{month} collection each full sync so
   // months keep their final numbers after they age out of the 90-day window.
   const monthlyOrderStats = {};
-  const soldUnits7 = {}, soldUnits30 = {}, soldUnitsDeadWindow = {}; // soldUnitsDeadWindow = DEADSTOCK_DAYS lookback, for dead-stock/slow-moving
+  const soldUnits7 = {}, soldUnits30 = {}, soldUnits90 = {}; // 7/30 feed the DSI velocity blend; 90 gates dead-stock candidacy/slow-moving
   const profitByProduct = {};    // full 90-day window — dashboard's default "All" view
   const profitByProductMTD = {}; // this month only — used by the email report
   const dailyProductProfit = {}; // { [date]: { [pid]: {title, profit, revenue, units} } } — lets the
@@ -470,7 +589,7 @@ function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
       if (vid) {
         if (ageDays <= 7) soldUnits7[vid] = (soldUnits7[vid] || 0) + qty;
         if (ageDays <= 30) soldUnits30[vid] = (soldUnits30[vid] || 0) + qty;
-        if (ageDays <= DEADSTOCK_DAYS) soldUnitsDeadWindow[vid] = (soldUnitsDeadWindow[vid] || 0) + qty;
+        if (ageDays <= DEADSTOCK_WINDOW_DAYS) soldUnits90[vid] = (soldUnits90[vid] || 0) + qty;
       }
 
       const pid = v?.productId || li.product?.id || li.product?.title || "unknown";
@@ -650,25 +769,38 @@ function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
     },
   };
 
-  const deadStock = [], slowMoving = [], stockAlerts = [], stockOut = [];
+  const deadStockCandidates = [], slowMoving = [], stockAlerts = [], stockOut = [];
   for (const [vid, v] of variantMap) {
-    const soldDeadWindow = soldUnitsDeadWindow[vid] || 0; // units sold in the last DEADSTOCK_DAYS
+    const sold90 = soldUnits90[vid] || 0;
     const sold30 = soldUnits30[vid] || 0;
     const sold7 = soldUnits7[vid] || 0;
-    // Dead stock = zero sales in the window. Slow moving = it did sell, just
-    // barely (1..SLOWMOVING_MAX_UNITS) — a distinct, less urgent tier from
-    // genuinely dead stock, not lumped into the same list.
-    if (v.inventory > 0 && soldDeadWindow === 0) {
-      deadStock.push({ title: v.productTitle, sku: v.sku, onHand: v.inventory,
-        capital: money(v.inventory * v.cost), sold60: soldDeadWindow });
-    } else if (v.inventory > 0 && soldDeadWindow <= SLOWMOVING_MAX_UNITS) {
-      slowMoving.push({ title: v.productTitle, sku: v.sku, onHand: v.inventory,
-        capital: money(v.inventory * v.cost), sold60: soldDeadWindow });
-    }
 
     const velocity7 = sold7 / 7;
     const velocity30 = sold30 / 30;
     const velocity = 0.6 * velocity7 + 0.4 * velocity30;
+    // DSI (Days Sales of Inventory) = on-hand ÷ current daily sales pace —
+    // "how many days to sell through what's on the shelf right now." A SKU
+    // with 0 velocity has infinite DSI (never clears at this pace), but that
+    // case is handled by the dead-stock branch below instead, not here.
+    const dsi = velocity > 0 ? v.inventory / velocity : Infinity;
+
+    // Dead-stock CANDIDATES only here — zero sales in DEADSTOCK_WINDOW_DAYS
+    // from today is a necessary but not sufficient condition; getRestockDates()
+    // below narrows this down further (a SKU restocked recently hasn't had a
+    // fair chance to sell yet, even if it shows 0 sold from today's vantage
+    // point). Slow moving = it DID sell, just not fast enough to clear
+    // current stock within SLOWMOVING_DSI_DAYS at that pace — the same
+    // 90-day standard dead stock uses, applied via DSI instead of a raw
+    // sold-units count so it scales with how much stock is actually sitting
+    // there (5 sold against 10 on hand isn't the same problem as 5 sold
+    // against 500 on hand).
+    if (v.inventory > 0 && sold90 === 0) {
+      deadStockCandidates.push({ title: v.productTitle, sku: v.sku, onHand: v.inventory,
+        capital: money(v.inventory * v.cost) });
+    } else if (v.inventory > 0 && sold90 > 0 && dsi > SLOWMOVING_DSI_DAYS) {
+      slowMoving.push({ title: v.productTitle, sku: v.sku, onHand: v.inventory,
+        capital: money(v.inventory * v.cost), sold90, dsi: Math.round(dsi) });
+    }
 
     // Already out of stock (zero or negative — Shopify allows negative
     // on-hand via oversold / "continue selling when out of stock") is a
@@ -709,6 +841,21 @@ function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
       }
     }
   }
+  console.log(`Checking restock dates for ${deadStockCandidates.length} dead-stock candidate SKUs…`);
+  const restockDates = await getRestockDates(deadStockCandidates);
+  const nowMs = Date.now();
+  const deadStock = [];
+  for (const c of deadStockCandidates) {
+    const info = restockDates.get(c.sku) || { date: null };
+    const daysSinceRestock = info.date ? Math.floor((nowMs - new Date(info.date).getTime()) / 864e5) : null;
+    // Restocked recently enough that it hasn't had a fair DEADSTOCK_WINDOW_DAYS
+    // chance to sell yet — not dead, just new. Skip it this cycle.
+    if (info.date && daysSinceRestock < DEADSTOCK_WINDOW_DAYS) continue;
+    deadStock.push({ ...c, sold90: 0, restockDate: info.date });
+  }
+  console.log(`Dead stock: ${deadStock.length} of ${deadStockCandidates.length} candidates `
+    + `(${deadStockCandidates.length - deadStock.length} excluded — restocked too recently to judge).`);
+
   deadStock.sort((a, b) => b.capital - a.capital);
   slowMoving.sort((a, b) => b.capital - a.capital);
   stockAlerts.sort((a, b) => a.daysLeft - b.daysLeft);
@@ -809,7 +956,7 @@ function buildInsights({ mtdSales, margin, deadStock, stockAlerts, stockOut, tar
   }
   if (deadStock.length) {
     const tied = deadStock.reduce((s, d) => s + d.capital, 0);
-    out.push(`${rm(tied)} of capital is tied up in ${deadStock.length} slow-moving SKUs — consider clearance.`);
+    out.push(`${rm(tied)} of capital is tied up in ${deadStock.length} dead-stock SKUs — consider clearance.`);
   }
   return out;
 }
@@ -1091,7 +1238,7 @@ async function sendEmail(m, yesterday) {
 // analytics recompute happens to land (currently just after MYT midnight).
 async function runFull() {
   const raw = await pull();
-  const metrics = compute(raw);
+  const metrics = await compute(raw);
   const { dailyTrend, monthlyOrderTrend, concentrationByPeriod, ...latest } = metrics;
 
   const customers = await pullCustomers();
