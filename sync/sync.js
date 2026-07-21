@@ -509,7 +509,7 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
 
   let mtdCost = 0;
   let refundTotal = 0, grossTotal = 0, cancelledOrders = 0;
-  const byRegion = {}, byChannel = {}; // scoped to this month (MTD) — see targetPct-style window below
+  const byChannel = {}; // scoped to this month (MTD) — feeds channelConcentration() below
   // Additional period buckets purely for the Business Analysis concentration
   // filter (This Month / Last Month / Last 90 Days) — This Month reuses
   // byChannel/profitByProductMTD above; these three are the missing periods.
@@ -527,10 +527,12 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
   const profitByProductMTD = {}; // this month only — used by the email report
   // Services (Sharpening/Engraving/Kydex/etc.) are excluded from all product
   // analytics above (no meaningful "Cost per item" in Shopify for a service,
-  // so profit/margin would be fake) — tracked here instead, by category, full
-  // 90-day window. Revenue-only, matching the order-level totals' own
-  // convention of counting this money as real, just not product-level profit.
-  const serviceStats = {};
+  // so profit/margin would be fake) — tracked here instead, by category, per
+  // day, matching the client-side date-range-aggregation trick
+  // dailyProductProfit below already uses (the dashboard's Services card has
+  // no server-computed "This Month"/full-window total anymore -- both are
+  // summed client-side from these per-day buckets).
+  const dailyServiceStats = {}; // { [date]: { [category]: {units, revenue} } }
   const dailyProductProfit = {}; // { [date]: { [pid]: {title, profit, revenue, units} } } — lets the
                                   // dashboard's "date range" filter aggregate any custom range client-side
   // Basket analysis ("frequently bought together") — pair co-occurrence counts
@@ -573,8 +575,6 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
     if (custId) customerRev90d[custId] = (customerRev90d[custId] || 0) + subtotal;
 
     if (createdMonthKey === monthKey) {
-      const prov = o.shippingAddress?.province || "Unknown";
-      byRegion[prov] = (byRegion[prov] || 0) + total;
       byChannel[ch] = (byChannel[ch] || 0) + total;
       if (custId) customerRevMTD[custId] = (customerRevMTD[custId] || 0) + subtotal;
     } else if (createdMonthKey === lastMonthKey) {
@@ -589,9 +589,13 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
         // by category (falls back to "Other Services" if a title-matched
         // item has no explicit SKU category yet).
         const category = getServiceCategory(li.sku) || "Other Services";
-        const stat = serviceStats[category] || (serviceStats[category] = { category, units: 0, revenue: 0 });
-        stat.units += num(li.quantity);
-        stat.revenue += num(li.discountedTotalSet?.shopMoney?.amount);
+        const lineQty = num(li.quantity);
+        const lineAmt = num(li.discountedTotalSet?.shopMoney?.amount);
+
+        const svcDayBucket = dailyServiceStats[createdDateStr] || (dailyServiceStats[createdDateStr] = {});
+        const svcDay = svcDayBucket[category] || (svcDayBucket[category] = { units: 0, revenue: 0 });
+        svcDay.units += lineQty;
+        svcDay.revenue += lineAmt;
         continue;
       }
       const vid = li.variant?.id;
@@ -696,6 +700,9 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
       products: Object.entries(dailyProductProfit[d] || {}).map(([pid, p]) => ({
         pid, title: p.title, profit: money(p.profit), revenue: money(p.revenue), units: p.units,
       })),
+      services: Object.entries(dailyServiceStats[d] || {}).map(([category, s]) => ({
+        category, units: s.units, revenue: money(s.revenue),
+      })),
     }));
 
   // Yesterday's finished total, for the dashboard's live "vs semalam" comparison
@@ -721,15 +728,6 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
   const grossProfit = mtdSales - mtdCost;
   const margin = mtdSales ? (grossProfit / mtdSales) * 100 : 0;
   const returnsRate = grossTotal ? (refundTotal / grossTotal) * 100 : 0; // 90-day, value-based — kept for AI context
-
-  const totalServiceRevenue = Object.values(serviceStats).reduce((s, c) => s + c.revenue, 0);
-  const services = Object.values(serviceStats)
-    .map((c) => ({
-      category: c.category, units: c.units, revenue: money(c.revenue),
-      avgPrice: c.units ? money(c.revenue / c.units) : 0,
-      pctOfSales: grossTotal ? money((c.revenue / grossTotal) * 100) : 0,
-    }))
-    .sort((a, b) => b.revenue - a.revenue);
 
   // This month's Returns %/Cancelled % KPI cards are now live off the Worker
   // (see app.js's loadMonthOrderSummary) — no MTD returns/cancelled fields
@@ -906,9 +904,7 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
     topProducts, topProductsMTD, totalProfit90: money(totalProfit90), // topProducts = full 90-day window (dashboard default); MTD = email only
     deadStock, slowMoving, stockAlerts: stockAlerts.slice(0, 20),
     stockOut, // deadStock/stockOut unsliced — dashboard shows first 20 with a "see more" toggle for the rest
-    services, servicesTotal: { revenue: money(totalServiceRevenue), pctOfSales: grossTotal ? money((totalServiceRevenue / grossTotal) * 100) : 0 },
     basketAnalysis, // "frequently bought together" — top pairs by lift, 90-day window
-    byRegion, byChannel, // both scoped to this month (MTD) — same window as mtd.sales
     ...computeInventory(variantMap),
     dailyTrend, monthlyOrderTrend, concentrationByPeriod, // all merged into businessAnalysis in runFull(), not written to dashboard/latest directly
     insights: buildInsights({ mtdSales, margin, deadStock, stockAlerts, stockOut, target: TARGET }),
