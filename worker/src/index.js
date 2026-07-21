@@ -71,6 +71,87 @@ async function fetchDashboardLatest(idToken) {
   return { ok: true, data: unwrapFirestoreFields(body.fields || {}) };
 }
 
+// dashboard/latest only gets its sales figures refreshed by the once-a-day
+// full sync (runQuick only touches inventory) -- so on its own it can be
+// close to 24h stale for "today"/"this month". This reads Gearevo's own
+// sales/today doc directly instead (open rules, no auth needed), the exact
+// same live source the dashboard's own "Today's Sales" KPI reads from, so
+// the chatbot's view of "today" is never older than a couple minutes.
+// Best-effort -- if it fails, the rest of the snapshot still answers fine.
+async function fetchGearevoTodayLive() {
+  const url = `https://firestore.googleapis.com/v1/projects/${GEAREVO_PROJECT_ID}/databases/(default)/documents/sales/today`;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const body = await res.json();
+    const f = unwrapFirestoreFields(body.fields || {});
+    return {
+      currentSaleToday: Number(f.currentSale || 0),
+      ordersToday: Number(f.totalOrders || 0),
+      channelsToday: f.channels || {},
+      regionsToday: f.regions || {},
+      lastUpdated: f.updatedAt || f.syncedAt || null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Shared runQuery helper for this project's own collections (calendarCards,
+// announcements) -- fetchDailyRange above has its own copy since it predates
+// this and isn't worth touching working code to dedupe.
+async function runFirestoreQuery(idToken, structuredQuery) {
+  const url = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents:runQuery`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${idToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ structuredQuery }),
+  });
+  if (!res.ok) throw new Error(`Firestore query failed: ${res.status} ${await res.text().catch(() => "")}`);
+  const rows = await res.json();
+  return (rows || []).filter((r) => r.document).map((r) => unwrapFirestoreFields(r.document.fields || {}));
+}
+
+// Same collection/fields the Calendar page itself reads (calendarCards, one
+// doc per card, keyed by an exact "date" field) -- real scheduled
+// tasks/meetings/reminders/events, not a snapshot baked into dashboard/latest.
+async function fetchCalendarEvents(idToken, from, to) {
+  const rows = await runFirestoreQuery(idToken, {
+    from: [{ collectionId: "calendarCards" }],
+    where: {
+      compositeFilter: {
+        op: "AND",
+        filters: [
+          { fieldFilter: { field: { fieldPath: "date" }, op: "GREATER_THAN_OR_EQUAL", value: { stringValue: from } } },
+          { fieldFilter: { field: { fieldPath: "date" }, op: "LESS_THAN_OR_EQUAL", value: { stringValue: to } } },
+        ],
+      },
+    },
+    orderBy: [{ field: { fieldPath: "date" }, direction: "ASCENDING" }],
+  });
+  return rows
+    .filter((r) => (r.cardType || "task") !== "target") // Target cards are monthly sales goals, not events
+    .map((r) => ({ date: r.date, cardType: r.cardType || "task", title: r.title || "", description: r.description || "", time: r.time || "" }));
+}
+
+// Same collection the Announcement page itself reads. Defaults to hiding
+// expired posts (matching what staff would actually see by default on that
+// page) unless the question is specifically about past/expired ones.
+async function fetchAnnouncements(idToken, includeExpired) {
+  const rows = await runFirestoreQuery(idToken, {
+    from: [{ collectionId: "announcements" }],
+    orderBy: [{ field: { fieldPath: "createdAt" }, direction: "DESCENDING" }],
+    limit: 50,
+  });
+  const todayStr = new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  return rows
+    .filter((p) => includeExpired || !p.expiresAt || p.expiresAt >= todayStr)
+    .map((p) => ({
+      title: p.title || "", message: p.message || "", category: p.category || "general",
+      pinned: !!p.pinned, postedAt: p.editedAt || p.createdAt || "", expiresAt: p.expiresAt || null,
+    }));
+}
+
 // Firestore's own runQuery endpoint — used by the get_sales_by_date_range
 // tool below, live per-call (not a fixed snapshot). Reads the same `daily`
 // collection app.js's own trend chart/date-range filters already read
@@ -218,6 +299,30 @@ const RETURNS_CANCELLED_TOOL = {
   },
 };
 
+const CALENDAR_TOOL = {
+  name: "get_calendar_events",
+  description: "Fetches real Calendar cards (tasks, meetings, reminders, events — not sales targets) for a specific date range from the company calendar. Use this for any question about what's scheduled, planned, or happening on specific dates.",
+  input_schema: {
+    type: "object",
+    properties: {
+      from: { type: "string", description: "Start date, inclusive, format YYYY-MM-DD" },
+      to: { type: "string", description: "End date, inclusive, format YYYY-MM-DD" },
+    },
+    required: ["from", "to"],
+  },
+};
+
+const ANNOUNCEMENTS_TOOL = {
+  name: "get_announcements",
+  description: "Fetches real company announcements/bulletin posts (title, message, category, pinned status, posted date). Defaults to only currently-active (non-expired) ones. Use this for any question about announcements, promos, or policies that were posted.",
+  input_schema: {
+    type: "object",
+    properties: {
+      includeExpired: { type: "boolean", description: "Set true to also include expired announcements. Defaults to false." },
+    },
+  },
+};
+
 // One retry on a 429/5xx (covers the "Overloaded" 529 Anthropic returns
 // under load) — everything else (bad request, auth) fails immediately since
 // retrying won't change the outcome.
@@ -262,10 +367,17 @@ async function runTool(call, idToken, env) {
     if (!MONTH_RE.test(input.month || "")) throw new Error("month must be YYYY-MM");
     return fetchMonthOrderSummary(input.month, env);
   }
+  if (call.name === "get_calendar_events") {
+    if (!DATE_RE.test(input.from || "") || !DATE_RE.test(input.to || "")) throw new Error("from/to must be YYYY-MM-DD");
+    return { events: await fetchCalendarEvents(idToken, input.from, input.to) };
+  }
+  if (call.name === "get_announcements") {
+    return { announcements: await fetchAnnouncements(idToken, !!input.includeExpired) };
+  }
   throw new Error(`Unknown tool: ${call.name}`);
 }
 
-async function askClaude(question, history, dashboardData, idToken, apiKey, env) {
+async function askClaude(question, history, dashboardData, liveToday, idToken, apiKey, env) {
   const todayMYT = new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const messages = [
     ...(history || []).map((m) => ({ role: m.role, content: m.content })),
@@ -278,13 +390,18 @@ ${BUSINESS_CONTEXT}
 
 Today's date (MYT): ${todayMYT}. Weeks run Monday-Sunday.
 
-You are given a snapshot of the dashboard's current data as JSON, covering the last 90 days and this month specifically (sales, margin, top products, dead/slow-moving/out-of-stock, customer segments, basket analysis). For anything that snapshot doesn't cover, use a tool instead of saying the data isn't available:
+You are given a snapshot of the dashboard's current data as JSON, covering the last 90 days and this month specifically (sales, margin, top products, dead/slow-moving/out-of-stock, customer segments, basket analysis), plus a separate live-today block that's always current (updated within minutes, not tied to the snapshot's own refresh schedule). For anything neither of those covers, use a tool instead of saying the data isn't available:
 - A different time period (this week, last 14 days, a past promotion, etc.) → get_sales_by_date_range for sales/products/services totals.
 - Which sales channel or region something sold through → get_channel_region_by_date_range (the snapshot has no channel/region breakdown at all).
 - Returns, refunds, or cancellations — especially order-level detail or any month other than a rolling 90-day rate → get_returns_and_cancelled.
-Combine tools if a question needs more than one. Answer using only real data (the snapshot or a tool result) — never invent figures, trends, or product names. If a tool genuinely can't answer something (e.g. a metric with no historical tracking at all, like stock levels from months ago), say so plainly rather than guessing. Keep answers concise and business-focused, in plain English. Use RM for currency figures, formatted to 2 decimal places.
+- What's on the calendar (tasks, meetings, reminders, events) for specific dates → get_calendar_events.
+- Company announcements/bulletin posts → get_announcements.
+Combine tools if a question needs more than one. Answer using only real data (the snapshot, the live-today block, or a tool result) — never invent figures, trends, product names, or calendar/announcement content. If something genuinely can't be answered (e.g. a metric with no historical tracking at all, like stock levels from months ago), say so plainly rather than guessing. Keep answers concise and business-focused, in plain English. Use RM for currency figures, formatted to 2 decimal places.
 
-Current dashboard data snapshot:
+Live today (always current):
+${JSON.stringify(liveToday)}
+
+Dashboard snapshot (90-day/this-month window):
 ${JSON.stringify(dashboardData)}`;
 
   // Agentic loop: Claude may ask for a tool, we run it and feed the result
@@ -295,7 +412,7 @@ ${JSON.stringify(dashboardData)}`;
       model: "claude-sonnet-5",
       max_tokens: 1024,
       system,
-      tools: [SALES_RANGE_TOOL, CHANNEL_REGION_TOOL, RETURNS_CANCELLED_TOOL],
+      tools: [SALES_RANGE_TOOL, CHANNEL_REGION_TOOL, RETURNS_CANCELLED_TOOL, CALENDAR_TOOL, ANNOUNCEMENTS_TOOL],
       messages,
     }, apiKey);
 
@@ -609,7 +726,8 @@ export default {
     }
 
     try {
-      const reply = await askClaude(question, body.history, firestoreResult.data, idToken, env.ANTHROPIC_API_KEY, env);
+      const liveToday = await fetchGearevoTodayLive();
+      const reply = await askClaude(question, body.history, firestoreResult.data, liveToday, idToken, env.ANTHROPIC_API_KEY, env);
       return jsonResponse({ reply });
     } catch (e) {
       return jsonResponse({ error: e.message || "Chat failed." }, 500);
