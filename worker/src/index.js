@@ -424,7 +424,21 @@ async function askClaude(question, history, dashboardData, liveToday, idToken, a
     { role: "user", content: question },
   ];
 
-  const system = `You are a business analyst assistant for Gearevo, a Malaysian knife/gear retailer selling through Shopify, Shopee, and TikTok Shop. You're answering questions from Gearevo's own staff about their business data, shown inside their internal dashboard.
+  // Split into blocks ordered stable -> volatile, with cache_control on the
+  // two that are worth caching. Prompt caching is a PREFIX match -- anything
+  // after a changed block can't hit cache -- so the least-often-changing
+  // content has to come first:
+  //   1. instructions/business context -- only changes when this file is
+  //      edited and redeployed; cached with a 1h TTL.
+  //   2. dashboard snapshot -- only changes when sync.js's full sync runs
+  //      (roughly daily); cached with the default 5m TTL, so bursts of
+  //      questions against the same snapshot mostly hit cache without
+  //      paying to keep an hour of a soon-to-be-stale snapshot alive.
+  //   3. live-today -- changes every couple of minutes; never cached,
+  //      always sent fresh, and it's small so the token cost is trivial.
+  // See shared/prompt-caching.md -- this is the standard "frozen prefix,
+  // volatile suffix" placement pattern.
+  const instructions = `You are a business analyst assistant for Gearevo, a Malaysian knife/gear retailer selling through Shopify, Shopee, and TikTok Shop. You're answering questions from Gearevo's own staff about their business data, shown inside their internal dashboard.
 
 ${BUSINESS_CONTEXT}
 
@@ -436,13 +450,17 @@ You are given a snapshot of the dashboard's current data as JSON, covering the l
 - Returns, refunds, or cancellations — especially order-level detail or any month other than a rolling 90-day rate → get_returns_and_cancelled.
 - What's on the calendar (tasks, meetings, reminders, events) for specific dates → get_calendar_events.
 - Company announcements/bulletin posts → get_announcements.
-Combine tools if a question needs more than one. Answer using only real data (the snapshot, the live-today block, or a tool result) — never invent figures, trends, product names, or calendar/announcement content. If something genuinely can't be answered (e.g. a metric with no historical tracking at all, like stock levels from months ago), say so plainly rather than guessing. Keep answers concise and business-focused, in plain English. Use RM for currency figures, formatted to 2 decimal places.
+Combine tools if a question needs more than one. Answer using only real data (the snapshot, the live-today block, or a tool result) — never invent figures, trends, product names, or calendar/announcement content. If something genuinely can't be answered (e.g. a metric with no historical tracking at all, like stock levels from months ago), say so plainly rather than guessing. Keep answers concise and business-focused, in plain English. Use RM for currency figures, formatted to 2 decimal places.`;
 
-Live today (always current):
-${JSON.stringify(liveToday)}
-
-Dashboard snapshot (90-day/this-month window):
-${JSON.stringify(dashboardData)}`;
+  const system = [
+    { type: "text", text: instructions, cache_control: { type: "ephemeral", ttl: "1h" } },
+    {
+      type: "text",
+      text: `Dashboard snapshot (90-day/this-month window):\n${JSON.stringify(dashboardData)}`,
+      cache_control: { type: "ephemeral" },
+    },
+    { type: "text", text: `Live today (always current):\n${JSON.stringify(liveToday)}` },
+  ];
 
   // Agentic loop: Claude may ask for a tool, we run it and feed the result
   // back, repeat until it gives a final text answer. Capped so a stuck model
@@ -455,6 +473,13 @@ ${JSON.stringify(dashboardData)}`;
       tools: [SALES_RANGE_TOOL, CHANNEL_REGION_TOOL, RETURNS_CANCELLED_TOOL, CALENDAR_TOOL, ANNOUNCEMENTS_TOOL],
       messages,
     }, apiKey);
+
+    // Best-effort visibility into whether caching is actually landing --
+    // check `wrangler tail` for this if cache_read_input_tokens stays 0
+    // across back-to-back questions when it shouldn't.
+    if (body.usage) {
+      console.log(`Cache: read=${body.usage.cache_read_input_tokens || 0} write=${body.usage.cache_creation_input_tokens || 0} fresh=${body.usage.input_tokens || 0}`);
+    }
 
     const toolUses = (body.content || []).filter((b) => b.type === "tool_use");
     if (body.stop_reason === "tool_use" && toolUses.length) {
