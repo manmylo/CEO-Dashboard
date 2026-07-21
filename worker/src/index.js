@@ -353,11 +353,51 @@ const MONTH_RE = /^\d{4}-\d{2}$/;
 // Runs one tool call and returns its JSON-serializable result. `env` is only
 // needed by get_returns_and_cancelled (Shopify credentials); the other two
 // read Firestore directly.
+// CEO Dashboard's own `daily/{date}` docs are only written by its once-a-day
+// full sync, so today's row in there can be hours stale -- or, right after
+// midnight MYT, not written for today at all yet. Whenever a requested range
+// includes today, this overwrites (or adds) today's slice with the genuinely
+// live sales/orders total from fetchGearevoTodayLive() instead. A brand-new
+// day with zero orders so far is handled the same way as any other value --
+// the live doc correctly reports 0, so the range total just reflects that.
+// Per-product/per-service breakdown for today isn't correctable this way
+// (Gearevo's sales/today doc has no line-item detail) -- whatever the stale
+// daily/{today} doc already had for those, if anything, is left as-is; only
+// the sales/orders TOTAL is guaranteed live-accurate.
+async function spliceLiveToday(days, todayMYT) {
+  const live = await fetchGearevoTodayLive();
+  if (!live) return false; // best-effort -- leave days untouched if this fetch fails
+  const idx = days.findIndex((d) => d.date === todayMYT);
+  const existing = idx >= 0 ? days[idx] : null;
+  const todayEntry = {
+    date: todayMYT,
+    todaySales: live.currentSaleToday,
+    orders: live.ordersToday,
+    products: existing?.products || [],
+    services: existing?.services || [],
+  };
+  if (idx >= 0) days[idx] = todayEntry; else days.push(todayEntry);
+  // True whenever today has real live sales but no product/service line
+  // items to show for it yet (products/services aren't correctable from the
+  // live doc) -- lets the caller flag that top products/services for the
+  // range may be missing today's items even though the sales total itself
+  // now correctly includes them.
+  return live.currentSaleToday > 0 && !(existing?.products?.length) && !(existing?.services?.length);
+}
+
 async function runTool(call, idToken, env) {
   const input = call.input || {};
   if (call.name === "get_sales_by_date_range") {
     if (!DATE_RE.test(input.from || "") || !DATE_RE.test(input.to || "")) throw new Error("from/to must be YYYY-MM-DD");
-    return aggregateDailyRange(await fetchDailyRange(idToken, input.from, input.to));
+    const days = await fetchDailyRange(idToken, input.from, input.to);
+    const todayMYT = new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    let todayItemsIncomplete = false;
+    if (input.from <= todayMYT && input.to >= todayMYT) todayItemsIncomplete = await spliceLiveToday(days, todayMYT);
+    const result = aggregateDailyRange(days);
+    if (todayItemsIncomplete) {
+      result.note = "Today's sales total is live-accurate, but today's individual products/services aren't reflected in topProducts/topServices yet (only settled from previous syncs) -- mention this if today's contribution to the ranking matters.";
+    }
+    return result;
   }
   if (call.name === "get_channel_region_by_date_range") {
     if (!DATE_RE.test(input.from || "") || !DATE_RE.test(input.to || "")) throw new Error("from/to must be YYYY-MM-DD");
