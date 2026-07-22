@@ -141,7 +141,10 @@ async function syncAllowlist() {
   if (!raw) return; // secret not set yet — don't wipe an existing allowlist
   const allowedEmails = raw.split(",").map((e) => e.trim().toLowerCase()).filter(Boolean);
   if (!allowedEmails.length) return;
-  await db.doc("config/access").set({ allowedEmails, updatedAt: new Date().toISOString() });
+  // merge:true -- this doc also carries an `admins` field (who can manage
+  // per-user page access), seeded once via sync/seed-admin.js, not from this
+  // secret. A plain .set() here would silently wipe it on every sync tick.
+  await db.doc("config/access").set({ allowedEmails, updatedAt: new Date().toISOString() }, { merge: true });
 }
 
 // ---------- graphql helper (cost-aware throttling + pagination) ----------
