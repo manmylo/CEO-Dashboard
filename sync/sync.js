@@ -1363,11 +1363,18 @@ async function fetchShopeeAdsRange(accessToken, startDate, endDate) {
 // a Shopee outage or dead refresh_token should never take down the actual
 // sales sync. Writes to its own shopeeAds/{date} collection, independent of
 // daily/{date} (which is Shopify-sourced sales, a different concern).
-async function syncShopeeAds() {
+//
+// windowDays controls how far back to re-fetch: runFull() (once/day) passes
+// the full 90-day window, so any late attribution revisions Shopee applies
+// to past days still get picked up. runQuick() (every ~2 min) passes 0 --
+// just today -- since re-fetching+rewriting all 90 days on every tick would
+// be pure waste (89 of those days can't have changed since 2 minutes ago)
+// against both Shopee's API and Firestore's write quota.
+async function syncShopeeAds(windowDays = SHOPEE_ADS_WINDOW_DAYS) {
   try {
     const accessToken = await getShopeeAccessToken();
     const end = myDateStr(new Date());
-    const start = myDateStr(new Date(Date.now() - SHOPEE_ADS_WINDOW_DAYS * 86400000));
+    const start = myDateStr(new Date(Date.now() - windowDays * 86400000));
     const byDate = await fetchShopeeAdsRange(accessToken, start, end);
     if (byDate.size === 0) {
       console.log("Shopee ads — no data returned for the window, skipping writes.");
@@ -1548,6 +1555,7 @@ async function runQuick() {
   const variantMap = await pullProducts();
   const inv = computeInventory(variantMap);
   await db.doc("dashboard/latest").set(inv, { merge: true });
+  await syncShopeeAds(0); // today only -- see syncShopeeAds()'s comment on windowDays
   console.log(`Quick sync — inventory RM${inv.endingInventoryRetailValue}.`);
   return null;
 }
