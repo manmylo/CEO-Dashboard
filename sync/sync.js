@@ -21,6 +21,7 @@
 
 import admin from "firebase-admin";
 import Anthropic from "@anthropic-ai/sdk";
+import crypto from "crypto";
 import { isExcluded, isExcludedTitle, getServiceCategory } from "./excluded-skus.js";
 
 // ---------- config ----------
@@ -92,6 +93,12 @@ function isInventoryExcludedTitle(title) {
 // ---------- firebase ----------
 admin.initializeApp({ credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SA)) });
 const db = admin.firestore();
+
+// ---------- Shopee Ads (ROAS) ----------
+const SHOPEE_PARTNER_ID = process.env.SHOPEE_PARTNER_ID;
+const SHOPEE_PARTNER_KEY = process.env.SHOPEE_PARTNER_KEY;
+const SHOPEE_SHOP_ID = process.env.SHOPEE_SHOP_ID;
+const SHOPEE_ADS_WINDOW_DAYS = 90; // matches ORDER_PULL_DAYS convention above
 
 // ---------- run lock ----------
 // The external cron (cronjobs.org) can trigger a new run while a previous one
@@ -1257,6 +1264,129 @@ async function sendEmail(m, yesterday) {
 // The daily EmailJS report is separate from both — see sendDailyEmailIfDue —
 // since the CEO wants it at 8am MYT specifically, not whenever the full
 // analytics recompute happens to land (currently just after MYT midnight).
+// Deliberately independent of the Gearevo sales dashboard/pipeline -- this
+// project's own Firestore (`db`, already ceo-dashboard-9e9b4 via FIREBASE_SA
+// above) is both where the rotating OAuth token lives (config/shopeeAuth)
+// and where the resulting ad-spend numbers land (shopeeAds/{date}), so this
+// whole feature has no dependency on Gearevo's Firestore or its own sync.py.
+const SHOPEE_HOST = "https://partner.shopeemobile.com";
+// Shopee's WAF silently 403s the default fetch User-Agent.
+const SHOPEE_HEADERS = { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Content-Type": "application/json" };
+
+function shopeeSign(path, timestamp, accessToken) {
+  let base = `${SHOPEE_PARTNER_ID}${path}${timestamp}`;
+  if (accessToken) base += `${accessToken}${SHOPEE_SHOP_ID}`;
+  return crypto.createHmac("sha256", SHOPEE_PARTNER_KEY).update(base).digest("hex");
+}
+
+// Returns a live access_token, refreshing only when the cached one is
+// stale/near-expiry. The rotated refresh_token is persisted back to
+// Firestore BEFORE returning -- Shopee kills the old refresh_token the
+// instant it issues a new one, so a crash after this call but before the
+// write would strand the pipeline until someone re-authorizes by hand.
+// Throws if config/shopeeAuth hasn't been seeded -- see shopee_seed_token.py.
+async function getShopeeAccessToken() {
+  const authRef = db.doc("config/shopeeAuth");
+  const snap = await authRef.get();
+  if (!snap.exists) throw new Error("config/shopeeAuth not seeded -- run shopee_seed_token.py once first");
+  const auth = snap.data();
+
+  if (auth.accessToken && Date.now() < auth.expiresAt - 5 * 60 * 1000) {
+    return auth.accessToken;
+  }
+
+  const path = "/api/v2/auth/access_token/get";
+  const ts = Math.floor(Date.now() / 1000);
+  const url = new URL(SHOPEE_HOST + path);
+  url.searchParams.set("partner_id", SHOPEE_PARTNER_ID);
+  url.searchParams.set("timestamp", ts);
+  url.searchParams.set("sign", shopeeSign(path, ts));
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: SHOPEE_HEADERS,
+    body: JSON.stringify({ partner_id: Number(SHOPEE_PARTNER_ID), refresh_token: auth.refreshToken, shop_id: Number(SHOPEE_SHOP_ID) }),
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(`Shopee token refresh failed: ${JSON.stringify(data)}`);
+
+  await authRef.set({
+    accessToken: data.access_token,
+    refreshToken: data.refresh_token,
+    expiresAt: Date.now() + data.expire_in * 1000,
+    updatedAt: new Date().toISOString(),
+  }, { merge: true });
+
+  return data.access_token;
+}
+
+// One call covers the whole window (unlike Shopify, Shopee's ads report
+// takes start_date/end_date directly) -- returns Map<"YYYY-MM-DD", {...}>.
+// Only expense/broad_gmv/broad_item_sold/broad_roas are used. broad_order
+// was tried and dropped: summed across a range it ran ~10-20% above Seller
+// Center's own "Orders" tile (an order touching multiple ad campaigns
+// appears to get counted once per campaign), while these four fields
+// matched Seller Center exactly during verification.
+async function fetchShopeeAdsRange(accessToken, startDate, endDate) {
+  const toDDMMYYYY = (iso) => { const [y, m, d] = iso.split("-"); return `${d}-${m}-${y}`; };
+  const path = "/api/v2/ads/get_all_cpc_ads_daily_performance";
+  const ts = Math.floor(Date.now() / 1000);
+  const url = new URL(SHOPEE_HOST + path);
+  url.searchParams.set("partner_id", SHOPEE_PARTNER_ID);
+  url.searchParams.set("timestamp", ts);
+  url.searchParams.set("sign", shopeeSign(path, ts, accessToken));
+  url.searchParams.set("shop_id", SHOPEE_SHOP_ID);
+  url.searchParams.set("access_token", accessToken);
+  url.searchParams.set("start_date", toDDMMYYYY(startDate));
+  url.searchParams.set("end_date", toDDMMYYYY(endDate));
+
+  const byDate = new Map();
+  const res = await fetch(url, { headers: SHOPEE_HEADERS });
+  const data = await res.json();
+  if (data.error || !data.response) return byDate;
+
+  for (const row of data.response) {
+    const expense = Number(row.expense || 0);
+    const sales = Number(row.broad_gmv || 0);
+    const [d, m, y] = row.date.split("-"); // Shopee returns DD-MM-YYYY
+    byDate.set(`${y}-${m}-${d}`, {
+      adSpend: money(expense),
+      adSales: money(sales),
+      adItemsSold: Number(row.broad_item_sold || 0),
+      adRoas: expense ? money(sales / expense) : 0,
+    });
+  }
+  return byDate;
+}
+
+// Best-effort, matching the rest of runFull()'s Shopify-side conventions --
+// a Shopee outage or dead refresh_token should never take down the actual
+// sales sync. Writes to its own shopeeAds/{date} collection, independent of
+// daily/{date} (which is Shopify-sourced sales, a different concern).
+async function syncShopeeAds() {
+  try {
+    const accessToken = await getShopeeAccessToken();
+    const end = myDateStr(new Date());
+    const start = myDateStr(new Date(Date.now() - SHOPEE_ADS_WINDOW_DAYS * 86400000));
+    const byDate = await fetchShopeeAdsRange(accessToken, start, end);
+    if (byDate.size === 0) {
+      console.log("Shopee ads — no data returned for the window, skipping writes.");
+      return;
+    }
+    let batch = db.batch();
+    let count = 0;
+    for (const [dateStr, ads] of byDate) {
+      batch.set(db.doc(`shopeeAds/${dateStr}`), { date: dateStr, ...ads, syncedAt: new Date().toISOString() }, { merge: true });
+      count++;
+      if (count >= 400) { await batch.commit(); batch = db.batch(); count = 0; }
+    }
+    if (count > 0) await batch.commit();
+    console.log(`Shopee ads — synced ${byDate.size} days.`);
+  } catch (e) {
+    console.error(`Shopee ads sync failed (non-fatal): ${e.message}`);
+  }
+}
+
 async function runFull() {
   const raw = await pull();
   const metrics = await compute(raw);
@@ -1371,6 +1501,9 @@ async function runFull() {
   batch.set(db.doc("sync/state"), { lastFullSyncDate: metrics.date, lastFullSyncAt: metrics.generatedAt });
   await batch.commit();
   console.log(`Full sync — dashboard/latest + ${dailyTrend.length} daily docs + ${latest.businessAnalysis.monthlyTrend.length} monthly docs.`);
+
+  await syncShopeeAds();
+
   return metrics;
 }
 

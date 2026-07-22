@@ -63,4 +63,7 @@ jobs:
           FORCE_BACKFILL: ${{ github.event.inputs.backfill }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ALLOWED_EMAILS: ${{ secrets.ALLOWED_EMAILS }}
+          SHOPEE_PARTNER_ID: ${{ secrets.SHOPEE_PARTNER_ID }}
+          SHOPEE_PARTNER_KEY: ${{ secrets.SHOPEE_PARTNER_KEY }}
+          SHOPEE_SHOP_ID: ${{ secrets.SHOPEE_SHOP_ID }}
         run: npm run sync
