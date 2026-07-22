@@ -98,7 +98,15 @@ const db = admin.firestore();
 const SHOPEE_PARTNER_ID = process.env.SHOPEE_PARTNER_ID;
 const SHOPEE_PARTNER_KEY = process.env.SHOPEE_PARTNER_KEY;
 const SHOPEE_SHOP_ID = process.env.SHOPEE_SHOP_ID;
-const SHOPEE_ADS_WINDOW_DAYS = 90; // matches ORDER_PULL_DAYS convention above
+// Shopee's get_all_cpc_ads_daily_performance rejects any range longer than
+// 1 month outright (error_date_range_too_long) -- 90 (matching this file's
+// other ORDER_PULL_DAYS convention) blew straight past that and silently
+// zeroed out every write. 30 stays under the cap while still always
+// reaching back to the 1st of the current month (no month exceeds 31 days,
+// and a 30-day trailing window from any date in a month reaches its 1st) --
+// enough for the "This Month" card; wouldn't be enough if we ever wanted a
+// longer rolling trend, but nothing here needs that yet.
+const SHOPEE_ADS_WINDOW_DAYS = 30;
 
 // ---------- run lock ----------
 // The external cron (cronjobs.org) can trigger a new run while a previous one
