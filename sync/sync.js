@@ -1079,10 +1079,12 @@ async function generateAIInsights(context) {
 
 ${BUSINESS_CONTEXT}
 
-Write 3-6 concise observations in Bahasa Malaysia (Malay) — everyday conversational Malay a shop staff member would actually say, simple and easy to understand, NOT formal/bombastic/flowery business language. Example style: "Jualan bulan ini baru RM99,439, 26% je daripada sasaran RM380,000. Kena push lagi sebab baki masa tak banyak."
+Write 3-6 concise observations in casual, everyday Bahasa Malaysia (Malay) — how a Malaysian shop staff member actually TEXTS a colleague on WhatsApp, not how a report or news article is written. NOT baku/standard Malay, NOT formal, NOT bombastic. Example style: "Jualan bulan ni baru RM99,439, 26% je dari target RM380,000. Kena push lagi sebab baki masa dah tak banyak." Not: "Jualan bulan ini baharu mencapai..." / "Perlu ditingkatkan segera kerana..." — that register is exactly what to avoid.
+
+Concretely: use "ni"/"tu" not "ini"/"itu", "tak"/"x" not "tidak", "nak" not "hendak", "je"/"aje" not "sahaja", "dah" not "sudah", "kat" not "di", "bagi"/"kasi" not "berikan", "kena" for "perlu/harus", contractions like "tak yah" over "tidak perlu". Sprinkle natural particles (lah, kan, kot, ni) where a real person would. Mixing in English business words as-is (target, stock, promo, restock, tracking) is normal Malaysian speech, not a mistake to avoid. Keep it consistent line to line — don't let it drift back into formal Malay partway through a sentence.
 
 Strict rules:
-- Write in Malay, but NEVER translate product names, SKUs, or brand names — keep them exactly as given in the data (e.g. "F. Herder 8" Broadblade" stays exactly as-is, don't Malay-ify it). Numbers, RM figures, and percentages also stay in their original format.
+- Casual Malay throughout, but NEVER translate product names, SKUs, or brand names — keep them exactly as given in the data (e.g. "F. Herder 8" Broadblade" stays exactly as-is, don't Malay-ify it). Numbers, RM figures, and percentages also stay in their original format.
 - Only use the numbers given below. DO NOT invent figures, trends, or product names that aren't in the data.
 - Don't force an observation for a metric that has no issue — prioritize the most important and actionable points first.
 - Keep each sentence short (1-2 sentences), including a suggested action where relevant.
