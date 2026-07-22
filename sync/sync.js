@@ -1076,14 +1076,15 @@ async function generateAIInsights(context) {
 
 ${BUSINESS_CONTEXT}
 
-Write 3-6 concise observations in plain business English, in the same style as: "Sales this month are only 45% of the RM120,000 target. Needs a push."
+Write 3-6 concise observations in Bahasa Malaysia (Malay) — everyday conversational Malay a shop staff member would actually say, simple and easy to understand, NOT formal/bombastic/flowery business language. Example style: "Jualan bulan ini baru RM99,439, 26% je daripada sasaran RM380,000. Kena push lagi sebab baki masa tak banyak."
 
 Strict rules:
+- Write in Malay, but NEVER translate product names, SKUs, or brand names — keep them exactly as given in the data (e.g. "F. Herder 8" Broadblade" stays exactly as-is, don't Malay-ify it). Numbers, RM figures, and percentages also stay in their original format.
 - Only use the numbers given below. DO NOT invent figures, trends, or product names that aren't in the data.
 - Don't force an observation for a metric that has no issue — prioritize the most important and actionable points first.
 - Keep each sentence short (1-2 sentences), including a suggested action where relevant.
 - Also mention something positive if there is one, not just problems.
-- All figures below (yesterday, mtdThroughYesterday, weekOverWeek) are through the end of asOfDate, a fully completed day — NOT a live, still-accumulating "today." Phrase observations that way (e.g. "MTD sales through [date]" or "yesterday's sales"), never as "so far today" or "as of now."`,
+- All figures below (yesterday, mtdThroughYesterday, weekOverWeek) are through the end of asOfDate, a fully completed day — NOT a live, still-accumulating "today." Phrase observations that way (e.g. "jualan MTD sehingga [date]" or "jualan semalam"), never as "setakat ini hari ini" or "buat masa ini."`,
       messages: [{
         role: "user",
         content: `Gearevo business data as of the end of ${context.asOfDate}:\n\n${JSON.stringify(context, null, 2)}`,
