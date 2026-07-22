@@ -1343,7 +1343,10 @@ async function fetchShopeeAdsRange(accessToken, startDate, endDate) {
   const byDate = new Map();
   const res = await fetch(url, { headers: SHOPEE_HEADERS });
   const data = await res.json();
-  if (data.error || !data.response) return byDate;
+  if (data.error || !data.response) {
+    console.log(`   Shopee ads range fetch (${startDate} -> ${endDate}) — HTTP ${res.status}: ${JSON.stringify(data)}`);
+    return byDate;
+  }
 
   for (const row of data.response) {
     const expense = Number(row.expense || 0);
