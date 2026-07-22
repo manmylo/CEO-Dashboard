@@ -98,15 +98,6 @@ const db = admin.firestore();
 const SHOPEE_PARTNER_ID = process.env.SHOPEE_PARTNER_ID;
 const SHOPEE_PARTNER_KEY = process.env.SHOPEE_PARTNER_KEY;
 const SHOPEE_SHOP_ID = process.env.SHOPEE_SHOP_ID;
-// Shopee's get_all_cpc_ads_daily_performance rejects any range longer than
-// 1 month outright (error_date_range_too_long) -- 90 (matching this file's
-// other ORDER_PULL_DAYS convention) blew straight past that and silently
-// zeroed out every write. 30 stays under the cap while still always
-// reaching back to the 1st of the current month (no month exceeds 31 days,
-// and a 30-day trailing window from any date in a month reaches its 1st) --
-// enough for the "This Month" card; wouldn't be enough if we ever wanted a
-// longer rolling trend, but nothing here needs that yet.
-const SHOPEE_ADS_WINDOW_DAYS = 30;
 
 // ---------- run lock ----------
 // The external cron (cronjobs.org) can trigger a new run while a previous one
@@ -1375,17 +1366,20 @@ async function fetchShopeeAdsRange(accessToken, startDate, endDate) {
 // sales sync. Writes to its own shopeeAds/{date} collection, independent of
 // daily/{date} (which is Shopify-sourced sales, a different concern).
 //
-// windowDays controls how far back to re-fetch: runFull() (once/day) passes
-// the full 90-day window, so any late attribution revisions Shopee applies
-// to past days still get picked up. runQuick() (every ~2 min) passes 0 --
-// just today -- since re-fetching+rewriting all 90 days on every tick would
-// be pure waste (89 of those days can't have changed since 2 minutes ago)
+// scope="month" (runFull, once/day) fetches from the 1st of the current MYT
+// month through today -- calendar-month-to-date, which is both exactly what
+// the "This Month" card needs AND, by construction, never exceeds ~31 days,
+// safely under Shopee's hard "date range can't be longer than 1 month" cap
+// (a fixed rolling window doesn't guarantee that -- 90 days blew past it
+// outright, and 30 still hit it since the inclusive span came to 31 days).
+// scope="today" (runQuick, every ~2 min) fetches just today, since
+// re-fetching+rewriting the whole month on every tick would be pure waste
 // against both Shopee's API and Firestore's write quota.
-async function syncShopeeAds(windowDays = SHOPEE_ADS_WINDOW_DAYS) {
+async function syncShopeeAds(scope = "month") {
   try {
     const accessToken = await getShopeeAccessToken();
     const end = myDateStr(new Date());
-    const start = myDateStr(new Date(Date.now() - windowDays * 86400000));
+    const start = scope === "today" ? end : `${myMonthKey(new Date())}-01`;
     const byDate = await fetchShopeeAdsRange(accessToken, start, end);
     if (byDate.size === 0) {
       console.log("Shopee ads — no data returned for the window, skipping writes.");
@@ -1566,7 +1560,7 @@ async function runQuick() {
   const variantMap = await pullProducts();
   const inv = computeInventory(variantMap);
   await db.doc("dashboard/latest").set(inv, { merge: true });
-  await syncShopeeAds(0); // today only -- see syncShopeeAds()'s comment on windowDays
+  await syncShopeeAds("today"); // see syncShopeeAds()'s comment on scope
   console.log(`Quick sync — inventory RM${inv.endingInventoryRetailValue}.`);
   return null;
 }
