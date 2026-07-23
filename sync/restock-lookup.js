@@ -108,7 +108,7 @@ export async function getRestockDates(candidates) {
     const chunk = skus.slice(i, i + RESTOCK_QUERY_CHUNK);
     const skuList = chunk.map((s) => `'${s.replace(/'/g, "\\'")}'`).join(", ");
     const ql = `FROM inventory_adjustment_history SHOW inventory_adjustment_change `
-      + `GROUP BY day, product_variant_sku, reference_document_type `
+      + `GROUP BY day, product_variant_sku, reference_document_type, inventory_change_reason `
       + `WHERE product_variant_sku IN (${skuList}) `
       + `SINCE -${RESTOCK_LOOKBACK_DAYS}d UNTIL today ORDER BY day ASC`;
 
@@ -133,21 +133,39 @@ export async function getRestockDates(candidates) {
 
     // Group by SKU, then by day, summing every type's change that day (needed
     // for accurate running-balance reconstruction) while separately flagging
-    // days that had a documented (tracked) or manual positive delta.
+    // days that had a documented (tracked) or manual positive delta, or a
+    // "received" event by inventory_change_reason.
+    //
+    // Confirmed via check-restock.js's raw diagnostic against real data: for
+    // a Transfer receipt, Shopify's inventory_adjustment_history reports
+    // inventory_change_reason "shipment_received" with a NEGATIVE
+    // inventory_adjustment_change (the pipeline draining as stock lands),
+    // not the positive on-hand gain the Admin UI displays -- so the
+    // change > 0 check above can never catch a transfer-based restock, no
+    // matter how reference_document_type is matched. inventory_change_reason
+    // is checked for "received" (not an exact match) on the same principle
+    // as the reference_document_type fix: match the concept ("stock was
+    // received"), not one specific string -- a PO's own received-reason
+    // string hasn't been confirmed and may differ (e.g. "purchase_order_
+    // received"), but should also contain "received".
     const seenTypes = new Set();
+    const seenReasons = new Set();
     const bySku = new Map();
     for (const r of result?.tableData?.rows || []) {
       const sku = r.product_variant_sku;
       if (!sku) continue;
       if (r.reference_document_type) seenTypes.add(r.reference_document_type);
+      if (r.inventory_change_reason) seenReasons.add(r.inventory_change_reason);
       const perDay = bySku.get(sku) || bySku.set(sku, new Map()).get(sku);
-      const day = perDay.get(r.day) || perDay.set(r.day, { total: 0, documentedPositive: false, manualPositive: false }).get(r.day);
+      const day = perDay.get(r.day) || perDay.set(r.day, { total: 0, documentedPositive: false, manualPositive: false, receivedEvent: false }).get(r.day);
       const change = Number(r.inventory_adjustment_change || 0);
       day.total += change;
       if (r.reference_document_type != null && change > 0) day.documentedPositive = true;
       if (r.reference_document_type == null && change > 0) day.manualPositive = true;
+      if (r.inventory_change_reason && r.inventory_change_reason.includes("received")) day.receivedEvent = true;
     }
     if (seenTypes.size) console.log(`   [INFO] Restock lookup — reference_document_type values seen: ${[...seenTypes].join(", ")}`);
+    if (seenReasons.size) console.log(`   [INFO] Restock lookup — inventory_change_reason values seen: ${[...seenReasons].join(", ")}`);
 
     // SKUs with zero rows returned at all are a DIFFERENT failure mode from
     // "rows exist but no documented-positive day" -- this is either a
@@ -165,10 +183,11 @@ export async function getRestockDates(candidates) {
       if (!perDay || !perDay.size) { results.set(sku, { date: null }); continue; }
       const days = [...perDay.keys()].sort(); // "YYYY-MM-DD" strings sort chronologically
 
-      // Tier 1: most recent documented (tracked) positive day — unambiguous
-      // on its own, no balance reconstruction needed.
+      // Tier 1: most recent documented (tracked) positive day, OR a day with
+      // a "received" event by reason (see receivedEvent note above) —
+      // unambiguous on its own, no balance reconstruction needed.
       let tier1Date = null;
-      for (const d of days) if (perDay.get(d).documentedPositive) tier1Date = d; // ascending order, last match wins
+      for (const d of days) if (perDay.get(d).documentedPositive || perDay.get(d).receivedEvent) tier1Date = d; // ascending order, last match wins
       if (tier1Date) { results.set(sku, { date: tier1Date }); continue; }
 
       // Tier 2: most recent manual adjustment that crossed the running
