@@ -150,15 +150,33 @@ async function syncAllowlist() {
 // ---------- graphql helper (cost-aware throttling + pagination) ----------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function graphql(query, variables = {}) {
+async function graphql(query, variables = {}, attempt = 0) {
   const res = await fetch(ENDPOINT, {
     method: "POST",
     headers: { "X-Shopify-Access-Token": TOKEN, "Content-Type": "application/json" },
     body: JSON.stringify({ query, variables }),
   });
-  if (res.status === 429) { await sleep(2000); return graphql(query, variables); }
+  if (res.status === 429) { await sleep(2000); return graphql(query, variables, attempt); }
   const body = await res.json();
-  if (body.errors) throw new Error("GraphQL errors: " + JSON.stringify(body.errors));
+  if (body.errors) {
+    // Shopify can throttle at the GraphQL layer (HTTP 200, but a THROTTLED
+    // error in the body) as well as at the HTTP layer (429, handled above).
+    // Without this retry, a throttled call was thrown away entirely by
+    // callers like getRestockDates(), silently marking every SKU in that
+    // chunk as "no restock data found" -- looking identical to a real
+    // no-data SKU even though Shopify never actually answered the query.
+    const throttled = body.errors.find((e) => e.extensions?.code === "THROTTLED");
+    if (throttled && attempt < 5) {
+      const resetAt = throttled.extensions?.cost?.windowResetAt;
+      const waitMs = resetAt
+        ? Math.min(Math.max(new Date(resetAt).getTime() - Date.now(), 500), 20000)
+        : 2000 * (attempt + 1);
+      console.log(`   [INFO] GraphQL THROTTLED, retrying in ${Math.round(waitMs / 1000)}s (attempt ${attempt + 1}/5)…`);
+      await sleep(waitMs);
+      return graphql(query, variables, attempt + 1);
+    }
+    throw new Error("GraphQL errors: " + JSON.stringify(body.errors));
+  }
 
   // cost-based rate limit: back off if the leaky bucket is running low
   const cost = body.extensions?.cost;
@@ -440,7 +458,8 @@ async function getRestockDates(candidates) {
         { q: ql }
       );
     } catch (e) {
-      console.log(`Restock-date lookup failed for a chunk, treating as unknown: ${e.message}`);
+      console.log(`Restock-date lookup failed for a chunk of ${chunk.length} SKU(s), treating as unknown: ${e.message}`);
+      console.log(`   [INFO] Restock lookup — affected SKUs: ${chunk.join(", ")}`);
       for (const sku of chunk) results.set(sku, { date: null });
       continue;
     }
