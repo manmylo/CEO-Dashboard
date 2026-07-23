@@ -1,0 +1,39 @@
+name: Check restock dates (diagnostic)
+
+on:
+  workflow_dispatch:
+    inputs:
+      skus:
+        description: "Comma-separated SKUs to check (leave blank for the default test list)"
+        type: string
+        default: ""
+
+# Read-only diagnostic against Shopify's own restock-date logic (same code
+# path as the full BI sync, via sync/restock-lookup.js) -- no Firestore
+# writes, no products/orders pull, no email. Runs in seconds instead of the
+# full sync's minutes, so the restock-date fix can be checked directly
+# against real Shopify data without burning API quota or waiting on a full
+# sync run. Doesn't share the "gearevo-sync" concurrency lock since it never
+# touches Firestore or the full sync's own lock doc.
+jobs:
+  check-restock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install deps
+        working-directory: sync
+        run: npm install
+
+      - name: Check restock dates
+        working-directory: sync
+        env:
+          SHOP_DOMAIN: ${{ secrets.SHOP_DOMAIN }}
+          SHOP_TOKEN: ${{ secrets.SHOP_TOKEN }}
+          SHOP_API_VERSION: ${{ secrets.SHOP_API_VERSION }}
+          SKUS: ${{ github.event.inputs.skus }}
+        run: node check-restock.js

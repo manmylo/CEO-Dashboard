@@ -4,7 +4,8 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "sync": "node sync.js"
+    "sync": "node sync.js",
+    "check-restock": "node check-restock.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.110.0",
