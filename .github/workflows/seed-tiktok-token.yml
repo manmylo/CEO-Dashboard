@@ -1,0 +1,37 @@
+name: Seed TikTok token (one-time)
+
+on:
+  workflow_dispatch:
+    inputs:
+      auth_code:
+        description: "auth_code copied from tiktok-callback.html after approving access"
+        type: string
+        required: true
+
+# One-off bootstrap -- exchanges the auth_code for a TikTok Marketing API
+# access_token (via sync/seed-tiktok-token.js) and seeds config/tiktokAuth in
+# Firestore. Re-run this only if TikTok access is revoked and needs
+# re-authorizing; normal syncs never trigger this workflow.
+jobs:
+  seed-tiktok-token:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install deps
+        working-directory: sync
+        run: npm install
+
+      - name: Exchange auth_code for access_token
+        working-directory: sync
+        env:
+          TIKTOK_APP_ID: ${{ secrets.TIKTOK_APP_ID }}
+          TIKTOK_APP_SECRET: ${{ secrets.TIKTOK_APP_SECRET }}
+          TIKTOK_ADVERTISER_ID: ${{ secrets.TIKTOK_ADVERTISER_ID }}
+          FIREBASE_SA: ${{ secrets.FIREBASE_SA }}
+          AUTH_CODE: ${{ github.event.inputs.auth_code }}
+        run: node seed-tiktok-token.js
