@@ -59,6 +59,63 @@ async function fetchOnHand(sku) {
     const r = results.get(c.sku);
     console.log(`${c.sku.padEnd(20)} onHand=${String(c.onHand).padEnd(6)} restockDate=${r?.date || "null (>180d / unknown)"}`);
   }
+
+  // Raw diagnostic: getRestockDates()'s query GROUPs BY day/sku/type only,
+  // which SUMS inventory_adjustment_change across every inventory state
+  // (on_hand, incoming, available, committed...) in that bucket. A transfer
+  // "received" event moves stock from incoming -> on_hand at the same
+  // moment, under the same reference_document_type -- if that shows up as
+  // two rows (on_hand +N, incoming -N) collapsed into one GROUP BY bucket,
+  // they could cancel out and the real on_hand increase goes invisible.
+  // User wants the fix to key specifically off "Shipment received" (not
+  // "marked as in transit" or other transfer sub-events), so this dumps the
+  // raw rows grouped by two candidate dimension names -- "inventory_state"
+  // and "inventory_change_reason" (both mentioned in Shopify's own docs for
+  // this dataset) -- to find which one actually distinguishes "received"
+  // from "in transit" against real data, instead of guessing the field name.
+  console.log("\n--- Raw rows by inventory_state (last 30d, diagnostic only) ---");
+  for (const sku of skus) {
+    const ql = `FROM inventory_adjustment_history SHOW inventory_adjustment_change `
+      + `GROUP BY day, product_variant_sku, reference_document_type, inventory_state `
+      + `WHERE product_variant_sku = '${sku.replace(/'/g, "\\'")}' `
+      + `SINCE -30d UNTIL today ORDER BY day ASC`;
+    try {
+      const data = await graphql(
+        `query($q: String!) { shopifyqlQuery(query: $q) { tableData { rows } parseErrors } }`,
+        { q: ql }
+      );
+      const result = data.shopifyqlQuery;
+      if (result?.parseErrors?.length) {
+        console.log(`${sku}: parseErrors (likely wrong dimension name) — ${JSON.stringify(result.parseErrors)}`);
+      } else {
+        console.log(`${sku}: ${JSON.stringify(result?.tableData?.rows || [], null, 2)}`);
+      }
+    } catch (e) {
+      console.log(`${sku}: raw query failed — ${e.message}`);
+    }
+  }
+
+  console.log("\n--- Raw rows by inventory_change_reason (last 30d, diagnostic only) ---");
+  for (const sku of skus) {
+    const ql = `FROM inventory_adjustment_history SHOW inventory_adjustment_change `
+      + `GROUP BY day, product_variant_sku, reference_document_type, inventory_change_reason `
+      + `WHERE product_variant_sku = '${sku.replace(/'/g, "\\'")}' `
+      + `SINCE -30d UNTIL today ORDER BY day ASC`;
+    try {
+      const data = await graphql(
+        `query($q: String!) { shopifyqlQuery(query: $q) { tableData { rows } parseErrors } }`,
+        { q: ql }
+      );
+      const result = data.shopifyqlQuery;
+      if (result?.parseErrors?.length) {
+        console.log(`${sku}: parseErrors (likely wrong dimension name) — ${JSON.stringify(result.parseErrors)}`);
+      } else {
+        console.log(`${sku}: ${JSON.stringify(result?.tableData?.rows || [], null, 2)}`);
+      }
+    } catch (e) {
+      console.log(`${sku}: raw query failed — ${e.message}`);
+    }
+  }
 })().catch((e) => {
   console.error("check-restock failed:", e);
   process.exit(1);
