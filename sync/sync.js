@@ -394,20 +394,23 @@ function computeCustomerSegments(customers) {
 // ---------- dead-stock restock-date lookup ----------
 // Shopify has no "last restocked" field anywhere — the only way to derive
 // one is ShopifyQL's inventory_adjustment_history dataset, which tracks
-// daily inventory changes per SKU with a reference_document_type:
-//   A type string containing "PurchaseOrder" (matched loosely, not just the
-//     exact "Inventory::PurchaseOrder" seen when this was first checked
-//     against live store data) — a real Shipment Received event. This store
-//     started using Purchase Orders in April 2026, so it's the reliable
-//     signal for anything since then. A real bug was traced to the strict
-//     equality check here: any OTHER PO-related type string Shopify used
-//     (partial receiving, etc.) fell through invisibly, making recently-
-//     restocked SKUs wrongly show as "no restock found" (>180d).
-//   null — no linked document, i.e. a manual quantity edit in the Admin.
-//     Used as a fallback restock signal for pre-April stock that predates
-//     the PO workflow: specifically, a manual adjustment that takes the
-//     running on-hand balance from <=0 up to a positive number (a genuine
-//     "back in stock" event), not just any manual tweak/correction.
+// daily inventory changes per SKU with a reference_document_type. Two tiers:
+//   Tier 1 — reference_document_type is non-null (any documented/tracked
+//     source, not a specific type string). Originally gated on an exact
+//     match against "Inventory::PurchaseOrder", which broke: receiving a PO
+//     shows up in the Admin's own Inventory History as "Shipment received",
+//     and confirmed real store data shows other tracked types too (e.g.
+//     "Inventory::Transfer") — there's no single confirmed enum value for
+//     "this was a real restock." Chasing the exact string was the wrong
+//     approach and silently made recently-restocked SKUs show as "no
+//     restock found" (>180d). The concept that actually matters is
+//     documented vs. undocumented, not which specific document type.
+//   Tier 2 — reference_document_type is null (a fully untracked manual
+//     quantity edit in the Admin), used only as a fallback for pre-PO-
+//     workflow stock (this store started using Purchase Orders in April
+//     2026): specifically a manual adjustment that takes the running
+//     on-hand balance from <=0 up to positive (a genuine "back in stock"
+//     event), not just any manual tweak/correction.
 // Only queried for dead-stock CANDIDATES (already known to have 0 sales in
 // DEADSTOCK_WINDOW_DAYS from today), not the whole catalog — shopifyqlQuery
 // has no pagination, so an unscoped store-wide query risks silent
@@ -450,16 +453,24 @@ async function getRestockDates(candidates) {
 
     // Group by SKU, then by day, summing every type's change that day (needed
     // for accurate running-balance reconstruction) while separately flagging
-    // days that had a PO-linked or manual positive delta.
+    // days that had a documented (tracked) or manual positive delta.
     //
-    // reference_document_type match is deliberately loose (.includes, not
-    // ===) -- a strict "Inventory::PurchaseOrder" equality check meant any
-    // OTHER PO-related type string Shopify might use (partial receiving,
-    // a different API surface, etc.) fell through to neither tier: not
-    // poPositive (wrong string) and not manualPositive (type isn't null
-    // either), so that day's restock was invisible to date-detection
-    // entirely even though real stock arrived -- real-world symptom:
-    // recently-restocked SKUs showing as "no restock found" (>180d).
+    // Originally gated Tier 1 on reference_document_type === "Inventory::
+    // PurchaseOrder" specifically. Real store data showed that's wrong: a PO
+    // shipment being received shows up in the Admin UI as "Shipment
+    // received", and Shopify's own community docs show OTHER tracked types
+    // too (e.g. "Inventory::Transfer") -- there's no single confirmed string
+    // for "this was a real restock." Chasing the exact enum was the wrong
+    // approach, and it silently broke real restocks (recently-restocked
+    // SKUs showing as "no restock found", >180d).
+    //
+    // Fixed by matching on the concept that actually matters: ANY documented/
+    // tracked source (reference_document_type is non-null, whatever the
+    // specific type) is a real, attributable stock movement -- PO shipment,
+    // transfer, or otherwise. Only a fully untracked manual edit (type is
+    // null) needs the stricter Tier 2 fallback (a balance crossing from
+    // zero, not just any tweak). seenTypes is still logged so the actual
+    // values this store produces are visible if this ever needs revisiting.
     const seenTypes = new Set();
     const bySku = new Map();
     for (const r of result?.tableData?.rows || []) {
@@ -467,10 +478,10 @@ async function getRestockDates(candidates) {
       if (!sku) continue;
       if (r.reference_document_type) seenTypes.add(r.reference_document_type);
       const perDay = bySku.get(sku) || bySku.set(sku, new Map()).get(sku);
-      const day = perDay.get(r.day) || perDay.set(r.day, { total: 0, poPositive: false, manualPositive: false }).get(r.day);
+      const day = perDay.get(r.day) || perDay.set(r.day, { total: 0, documentedPositive: false, manualPositive: false }).get(r.day);
       const change = Number(r.inventory_adjustment_change || 0);
       day.total += change;
-      if (r.reference_document_type && r.reference_document_type.includes("PurchaseOrder") && change > 0) day.poPositive = true;
+      if (r.reference_document_type != null && change > 0) day.documentedPositive = true;
       if (r.reference_document_type == null && change > 0) day.manualPositive = true;
     }
     if (seenTypes.size) console.log(`   [INFO] Restock lookup — reference_document_type values seen: ${[...seenTypes].join(", ")}`);
@@ -480,10 +491,10 @@ async function getRestockDates(candidates) {
       if (!perDay || !perDay.size) { results.set(sku, { date: null }); continue; }
       const days = [...perDay.keys()].sort(); // "YYYY-MM-DD" strings sort chronologically
 
-      // Tier 1: most recent PO-linked positive day — unambiguous on its own,
-      // no balance reconstruction needed.
+      // Tier 1: most recent documented (tracked) positive day — unambiguous
+      // on its own, no balance reconstruction needed.
       let tier1Date = null;
-      for (const d of days) if (perDay.get(d).poPositive) tier1Date = d; // ascending order, last match wins
+      for (const d of days) if (perDay.get(d).documentedPositive) tier1Date = d; // ascending order, last match wins
       if (tier1Date) { results.set(sku, { date: tier1Date }); continue; }
 
       // Tier 2: most recent manual adjustment that crossed the running
