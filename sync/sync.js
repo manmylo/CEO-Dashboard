@@ -155,7 +155,7 @@ const Q_PRODUCTS = `
     products(first: 25, after: $cursor) {
       pageInfo { hasNextPage endCursor }
       nodes {
-        id title productType
+        id title productType vendor
         variants(first: 100) {
           nodes {
             id sku price inventoryQuantity
@@ -236,6 +236,7 @@ async function pullProducts() {
         productId: p.id,
         productTitle: p.title,
         category: p.productType || "Uncategorized",
+        vendor: p.vendor || "",
         sku: v.sku || "",
         price: num(v.price),
         inventory: num(v.inventoryQuantity),
@@ -693,6 +694,7 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
     // against 500 on hand).
     if (v.inventory > 0 && sold90 === 0) {
       deadStockCandidates.push({ title: v.productTitle, sku: v.sku, onHand: v.inventory,
+        vendor: v.vendor, cost: money(v.cost), price: money(v.price),
         capital: money(v.inventory * v.cost) });
     } else if (v.inventory > 0 && sold90 > 0 && dsi > SLOWMOVING_DSI_DAYS) {
       slowMoving.push({ title: v.productTitle, sku: v.sku, onHand: v.inventory,
