@@ -1,0 +1,36 @@
+name: Check TikTok ads metrics (diagnostic)
+
+on:
+  workflow_dispatch:
+    inputs:
+      metrics:
+        description: "Comma-separated metric names to test (leave blank for the default candidate list)"
+        type: string
+        default: ""
+
+# Read-only diagnostic against TikTok's report/integrated/get endpoint --
+# confirms which metric field names the account's data actually supports
+# (esp. ROAS/gross-revenue for Shop Ads, which aren't confirmed from docs
+# alone) before any of it gets wired into the full sync. No Firestore
+# writes beyond the read of config/tiktokAuth's access_token.
+jobs:
+  check-tiktok-ads:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install deps
+        working-directory: sync
+        run: npm install
+
+      - name: Check TikTok ads metrics
+        working-directory: sync
+        env:
+          TIKTOK_ADVERTISER_ID: ${{ secrets.TIKTOK_ADVERTISER_ID }}
+          FIREBASE_SA: ${{ secrets.FIREBASE_SA }}
+          METRICS: ${{ github.event.inputs.metrics }}
+        run: node check-tiktok-ads.js
