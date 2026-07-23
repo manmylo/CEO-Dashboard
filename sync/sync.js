@@ -395,9 +395,14 @@ function computeCustomerSegments(customers) {
 // Shopify has no "last restocked" field anywhere — the only way to derive
 // one is ShopifyQL's inventory_adjustment_history dataset, which tracks
 // daily inventory changes per SKU with a reference_document_type:
-//   "Inventory::PurchaseOrder" — a real Shipment Received event (confirmed
-//     against live store data: this store started using Purchase Orders in
-//     April 2026, so this is the reliable signal for anything since then).
+//   A type string containing "PurchaseOrder" (matched loosely, not just the
+//     exact "Inventory::PurchaseOrder" seen when this was first checked
+//     against live store data) — a real Shipment Received event. This store
+//     started using Purchase Orders in April 2026, so it's the reliable
+//     signal for anything since then. A real bug was traced to the strict
+//     equality check here: any OTHER PO-related type string Shopify used
+//     (partial receiving, etc.) fell through invisibly, making recently-
+//     restocked SKUs wrongly show as "no restock found" (>180d).
 //   null — no linked document, i.e. a manual quantity edit in the Admin.
 //     Used as a fallback restock signal for pre-April stock that predates
 //     the PO workflow: specifically, a manual adjustment that takes the
@@ -446,17 +451,29 @@ async function getRestockDates(candidates) {
     // Group by SKU, then by day, summing every type's change that day (needed
     // for accurate running-balance reconstruction) while separately flagging
     // days that had a PO-linked or manual positive delta.
+    //
+    // reference_document_type match is deliberately loose (.includes, not
+    // ===) -- a strict "Inventory::PurchaseOrder" equality check meant any
+    // OTHER PO-related type string Shopify might use (partial receiving,
+    // a different API surface, etc.) fell through to neither tier: not
+    // poPositive (wrong string) and not manualPositive (type isn't null
+    // either), so that day's restock was invisible to date-detection
+    // entirely even though real stock arrived -- real-world symptom:
+    // recently-restocked SKUs showing as "no restock found" (>180d).
+    const seenTypes = new Set();
     const bySku = new Map();
     for (const r of result?.tableData?.rows || []) {
       const sku = r.product_variant_sku;
       if (!sku) continue;
+      if (r.reference_document_type) seenTypes.add(r.reference_document_type);
       const perDay = bySku.get(sku) || bySku.set(sku, new Map()).get(sku);
       const day = perDay.get(r.day) || perDay.set(r.day, { total: 0, poPositive: false, manualPositive: false }).get(r.day);
       const change = Number(r.inventory_adjustment_change || 0);
       day.total += change;
-      if (r.reference_document_type === "Inventory::PurchaseOrder" && change > 0) day.poPositive = true;
+      if (r.reference_document_type && r.reference_document_type.includes("PurchaseOrder") && change > 0) day.poPositive = true;
       if (r.reference_document_type == null && change > 0) day.manualPositive = true;
     }
+    if (seenTypes.size) console.log(`   [INFO] Restock lookup — reference_document_type values seen: ${[...seenTypes].join(", ")}`);
 
     for (const sku of chunk) {
       const perDay = bySku.get(sku);
