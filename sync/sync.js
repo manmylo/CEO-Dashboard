@@ -486,6 +486,17 @@ async function getRestockDates(candidates) {
     }
     if (seenTypes.size) console.log(`   [INFO] Restock lookup — reference_document_type values seen: ${[...seenTypes].join(", ")}`);
 
+    // SKUs with zero rows returned at all are a DIFFERENT failure mode from
+    // "rows exist but no documented-positive day" -- this is either a
+    // genuine no-restock-in-window SKU, OR a query/matching problem: ShopifyQL's
+    // product_variant_sku not exactly matching the candidate's own SKU string
+    // (case, whitespace, or a variant using a different SKU field than
+    // expected). Logged explicitly so a "still shows >180d after the fix"
+    // report can be diagnosed by which bucket it's actually in, instead of
+    // guessing a third time.
+    const noRowsAtAll = chunk.filter((sku) => !bySku.get(sku)?.size);
+    if (noRowsAtAll.length) console.log(`   [INFO] Restock lookup — ${noRowsAtAll.length} SKU(s) had ZERO inventory_adjustment_history rows in the ${RESTOCK_LOOKBACK_DAYS}d window: ${noRowsAtAll.join(", ")}`);
+
     for (const sku of chunk) {
       const perDay = bySku.get(sku);
       if (!perDay || !perDay.size) { results.set(sku, { date: null }); continue; }
