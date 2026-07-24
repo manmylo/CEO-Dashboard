@@ -938,10 +938,12 @@ async function generateAIInsights(context) {
     const rootsys = new OpenAI({ baseURL: "https://rootsys.cloud/v1", apiKey: process.env.ROOTSYS_API_KEY });
     const response = await rootsys.chat.completions.create({
       model: "fiq/hy3-tencent",
-      // 1024 was too tight once reasoning tokens share this same budget --
-      // could truncate the JSON output mid-string before it finished (same
-      // failure mode already fixed in generateStrategicAnalysis below by
-      // raising its max_tokens; applying the same fix here).
+      // hy3-tencent is a reasoning model -- left enabled, a single call here
+      // burned 150-180K reasoning tokens and took ~60s for output that's
+      // just a handful of short strings. Disabling it (verified live: same
+      // output quality, ~4s instead of ~60s) is the actual fix; this is a
+      // fast tactical summary, not a task that needs deliberation.
+      reasoning: { enabled: false },
       max_tokens: 4096,
       messages: [
         {
@@ -1013,6 +1015,9 @@ async function generateStrategicAnalysis(context) {
     const rootsys = new OpenAI({ baseURL: "https://rootsys.cloud/v1", apiKey: process.env.ROOTSYS_API_KEY });
     const response = await rootsys.chat.completions.create({
       model: "fiq/hy3-tencent",
+      // See generateAIInsights()'s comment above -- reasoning left enabled
+      // turns this into a ~60s call for no quality gain.
+      reasoning: { enabled: false },
       max_tokens: 4096,
       messages: [
         {

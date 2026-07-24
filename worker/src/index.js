@@ -480,6 +480,11 @@ ${JSON.stringify(liveToday)}`;
   for (let round = 0; round < 4; round++) {
     const body = await callRootsys({
       model: "fiq/hy3-tencent",
+      // hy3-tencent is a reasoning model -- left enabled, this turned a chat
+      // reply into a ~60s round trip for no measurable quality gain
+      // (verified: tool-calling and answer quality both held up fine with
+      // it off). A live chat panel needs to feel responsive.
+      reasoning: { enabled: false },
       max_tokens: 1024,
       tools: [SALES_RANGE_TOOL, CHANNEL_REGION_TOOL, RETURNS_CANCELLED_TOOL, CALENDAR_TOOL, ANNOUNCEMENTS_TOOL],
       messages,
