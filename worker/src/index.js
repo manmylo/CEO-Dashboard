@@ -348,8 +348,11 @@ const ANNOUNCEMENTS_TOOL = {
 };
 
 // One retry on a 429/5xx — everything else (bad request, auth) fails
-// immediately since retrying won't change the outcome.
-async function callRootsys(payload, apiKey) {
+// immediately since retrying won't change the outcome. Always requests SSE
+// (stream: true) -- askAssistant() streams every round, not just the final
+// one, since a round only turns out to be "final text" vs "a tool call"
+// once data starts arriving.
+async function streamRootsys(payload, apiKey) {
   for (let attempt = 0; attempt < 2; attempt++) {
     const res = await fetch("https://rootsys.cloud/v1/chat/completions", {
       method: "POST",
@@ -357,9 +360,9 @@ async function callRootsys(payload, apiKey) {
         "Content-Type": "application/json",
         Authorization: `Bearer ${apiKey}`,
       },
-      body: JSON.stringify(payload),
+      body: JSON.stringify({ ...payload, stream: true }),
     });
-    if (res.ok) return res.json();
+    if (res.ok) return res.body;
     if (attempt === 0 && (res.status === 429 || res.status >= 500)) {
       await new Promise((r) => setTimeout(r, 1500));
       continue;
@@ -367,6 +370,54 @@ async function callRootsys(payload, apiKey) {
     const text = await res.text().catch(() => "");
     throw new Error(`rootsys.cloud API error ${res.status}: ${text}`);
   }
+}
+
+// Parses one round's SSE byte stream. Content deltas are forwarded live via
+// onChunk (real token-by-token typing on the client) as they arrive --
+// verified live that content and tool_calls never interleave in the same
+// round for this model, so streaming content immediately is safe. tool_calls
+// CAN'T be forwarded/used incrementally -- each one's `arguments` string
+// arrives fragmented across many chunks (id/name once, then argument
+// characters trickling in), so those are buffered here and only returned
+// once the stream ends.
+async function consumeStream(stream, onChunk) {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  let content = "";
+  const toolCalls = [];
+  let finishReason = null;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buf.indexOf("\n\n")) >= 0) {
+      const line = buf.slice(0, idx).trim();
+      buf = buf.slice(idx + 2);
+      if (!line.startsWith("data:")) continue; // skip OPENROUTER PROCESSING keep-alive comments etc.
+      const data = line.slice(5).trim();
+      if (data === "[DONE]") continue;
+      let obj;
+      try { obj = JSON.parse(data); } catch { continue; }
+      const choice = obj.choices?.[0];
+      if (!choice) continue;
+      if (choice.finish_reason) finishReason = choice.finish_reason;
+      const delta = choice.delta || {};
+      if (delta.content) {
+        content += delta.content;
+        if (onChunk) await onChunk(delta.content);
+      }
+      for (const tc of delta.tool_calls || []) {
+        const i = tc.index ?? 0;
+        const slot = toolCalls[i] || (toolCalls[i] = { id: "", function: { name: "", arguments: "" } });
+        if (tc.id) slot.id = tc.id;
+        if (tc.function?.name) slot.function.name += tc.function.name;
+        if (tc.function?.arguments) slot.function.arguments += tc.function.arguments;
+      }
+    }
+  }
+  return { content, toolCalls: toolCalls.filter(Boolean), finishReason };
 }
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -439,7 +490,7 @@ async function runTool(call, idToken, env) {
   throw new Error(`Unknown tool: ${call.name}`);
 }
 
-async function askAssistant(question, history, dashboardData, liveToday, idToken, apiKey, env) {
+async function askAssistant(question, history, dashboardData, liveToday, idToken, apiKey, env, onChunk) {
   const todayMYT = new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
   // Anthropic's `system` param + cache_control-based prompt caching (frozen
@@ -476,9 +527,13 @@ ${JSON.stringify(liveToday)}`;
 
   // Agentic loop: the assistant may ask for a tool, we run it and feed the
   // result back, repeat until it gives a final text answer. Capped so a
-  // stuck model can't loop forever.
+  // stuck model can't loop forever. Every round streams -- a round only
+  // reveals whether it's "a tool call" or "the final answer" once data
+  // starts arriving, so content deltas are forwarded to onChunk live as they
+  // come in; if the round turns out to be a tool call instead (content was
+  // empty throughout, confirmed by testing), there's nothing to undo.
   for (let round = 0; round < 4; round++) {
-    const body = await callRootsys({
+    const stream = await streamRootsys({
       model: "fiq/hy3-tencent",
       // hy3-tencent is a reasoning model -- left enabled, this turned a chat
       // reply into a ~60s round trip for no measurable quality gain
@@ -490,17 +545,16 @@ ${JSON.stringify(liveToday)}`;
       messages,
     }, apiKey);
 
-    if (body.usage) {
-      console.log(`Usage: prompt=${body.usage.prompt_tokens || 0} completion=${body.usage.completion_tokens || 0} cost=${body.usage.cost ?? "?"}`);
-    }
+    const { content, toolCalls, finishReason } = await consumeStream(stream, onChunk);
 
-    const message = body.choices?.[0]?.message;
-    const toolCalls = message?.tool_calls || [];
     if (toolCalls.length) {
       // OpenAI-style: echo the assistant's tool_calls back verbatim, then one
       // role:"tool" message per call (not Anthropic's single combined
       // tool_result-blocks message).
-      messages.push({ role: "assistant", content: message.content ?? null, tool_calls: toolCalls });
+      messages.push({
+        role: "assistant", content: content || null,
+        tool_calls: toolCalls.map((tc) => ({ id: tc.id, type: "function", function: tc.function })),
+      });
       for (const tc of toolCalls) {
         let resultPayload;
         try {
@@ -514,10 +568,10 @@ ${JSON.stringify(liveToday)}`;
       continue;
     }
 
-    if (!message?.content) {
-      throw new Error(`No content in assistant response (finish_reason: ${body.choices?.[0]?.finish_reason})`);
+    if (!content) {
+      throw new Error(`No content in assistant response (finish_reason: ${finishReason})`);
     }
-    return message.content;
+    return content;
   }
   throw new Error("Assistant made too many tool calls without answering.");
 }
@@ -746,7 +800,7 @@ async function verifyAuth(idToken) {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders() });
     }
@@ -804,10 +858,31 @@ export default {
       );
     }
 
+    // Streamed as plain text, not wrapped in JSON -- the client reads the
+    // response body directly and appends each chunk to the chat bubble live.
+    // Errors that happen AFTER streaming has started (rootsys.cloud dies
+    // mid-answer) can't change the HTTP status at that point, so they're
+    // appended to the stream as a visible marker instead; anything that
+    // fails BEFORE streaming starts (auth, the Firestore snapshot fetch
+    // above) still returns a normal jsonResponse with a real status code.
     try {
       const liveToday = await fetchGearevoTodayLive();
-      const reply = await askAssistant(question, body.history, firestoreResult.data, liveToday, idToken, env.ROOTSYS_API_KEY, env);
-      return jsonResponse({ reply });
+      const { readable, writable } = new TransformStream();
+      const writer = writable.getWriter();
+      const encoder = new TextEncoder();
+      ctx.waitUntil((async () => {
+        try {
+          await askAssistant(
+            question, body.history, firestoreResult.data, liveToday, idToken, env.ROOTSYS_API_KEY, env,
+            (chunk) => writer.write(encoder.encode(chunk))
+          );
+        } catch (e) {
+          await writer.write(encoder.encode(`\n\n[Error: ${e.message || "Chat failed."}]`));
+        } finally {
+          await writer.close();
+        }
+      })());
+      return new Response(readable, { headers: { "Content-Type": "text/plain; charset=utf-8", ...corsHeaders() } });
     } catch (e) {
       return jsonResponse({ error: e.message || "Chat failed." }, 500);
     }
