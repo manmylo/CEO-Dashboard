@@ -1121,7 +1121,7 @@ async function sendEmail(m, yesterday) {
     body: JSON.stringify({
       service_id: EMAILJS_SERVICE_ID, template_id: EMAILJS_TEMPLATE_ID,
       user_id: EMAILJS_PUBLIC_KEY, accessToken: EMAILJS_PRIVATE_KEY,
-      template_params: { to_email: REPORT_TO, subject: `Gearevo Report ${yesterday.date}`, message: body },
+      template_params: { to_email: REPORT_TO, subject: `Gearevo Report ${yesterday.date}`, message: body, header: "DAILY REPORT" },
     }),
   });
   console.log(res.ok ? "Email sent." : `Email failed: ${res.status} ${await res.text()}`);
