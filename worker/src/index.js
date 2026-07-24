@@ -10,7 +10,11 @@
  * duplicate auth/allowlist logic to keep in sync with firestore.rules.
  *
  * Secrets (set via `wrangler secret put`):
- *   ANTHROPIC_API_KEY
+ *   ROOTSYS_API_KEY -- rootsys.cloud's OpenAI-compatible endpoint, model
+ *   fiq/hy3-tencent. Plain fetch (no SDK) against
+ *   https://rootsys.cloud/v1/chat/completions, same as the previous
+ *   Anthropic integration -- no need to bundle the openai npm package into
+ *   this Worker just for one REST call.
  *   SHOP_DOMAIN, SHOP_TOKEN, SHOP_API_VERSION (optional, e.g. 2026-01) —
  *   same Shopify store/credentials sync.js uses, needed for POST /orders.
  */
@@ -261,79 +265,97 @@ async function fetchGearevoChannelRegion(from, to) {
   return { daysInRange, channels: sortDesc(byChannel), regions: sortDesc(byRegion) };
 }
 
+// OpenAI-style function-tool shape ({type:"function", function:{name,
+// description, parameters}}) -- these used to be Anthropic's
+// {name, description, input_schema}. runTool() below is untouched: askAssistant()
+// normalizes each returned tool_call into {name, input} right after parsing
+// the response, so runTool() never has to know which provider shape it came from.
 const SALES_RANGE_TOOL = {
-  name: "get_sales_by_date_range",
-  description: "Aggregates real sales data (total sales, order count, top products by revenue, top services by revenue) for any specific date range you choose — not limited to the pre-computed 90-day/this-month figures in the dashboard snapshot. Use this for ANY question about a period the snapshot doesn't already cover (e.g. \"this week\", \"last 14 days\", \"last Ramadan\", a specific date range) instead of saying the data isn't available.",
-  input_schema: {
-    type: "object",
-    properties: {
-      from: { type: "string", description: "Start date, inclusive, format YYYY-MM-DD" },
-      to: { type: "string", description: "End date, inclusive, format YYYY-MM-DD" },
+  type: "function",
+  function: {
+    name: "get_sales_by_date_range",
+    description: "Aggregates real sales data (total sales, order count, top products by revenue, top services by revenue) for any specific date range you choose — not limited to the pre-computed 90-day/this-month figures in the dashboard snapshot. Use this for ANY question about a period the snapshot doesn't already cover (e.g. \"this week\", \"last 14 days\", \"last Ramadan\", a specific date range) instead of saying the data isn't available.",
+    parameters: {
+      type: "object",
+      properties: {
+        from: { type: "string", description: "Start date, inclusive, format YYYY-MM-DD" },
+        to: { type: "string", description: "End date, inclusive, format YYYY-MM-DD" },
+      },
+      required: ["from", "to"],
     },
-    required: ["from", "to"],
   },
 };
 
 const CHANNEL_REGION_TOOL = {
-  name: "get_channel_region_by_date_range",
-  description: "Aggregates real sales by sales channel (Shopee, TikTok, Online Store, Point of Sale, etc.) and by Malaysian region/state, for any date range you choose. Use this for any question about which channel or region something sold through/in — the main dashboard snapshot does not include this.",
-  input_schema: {
-    type: "object",
-    properties: {
-      from: { type: "string", description: "Start date, inclusive, format YYYY-MM-DD" },
-      to: { type: "string", description: "End date, inclusive, format YYYY-MM-DD" },
+  type: "function",
+  function: {
+    name: "get_channel_region_by_date_range",
+    description: "Aggregates real sales by sales channel (Shopee, TikTok, Online Store, Point of Sale, etc.) and by Malaysian region/state, for any date range you choose. Use this for any question about which channel or region something sold through/in — the main dashboard snapshot does not include this.",
+    parameters: {
+      type: "object",
+      properties: {
+        from: { type: "string", description: "Start date, inclusive, format YYYY-MM-DD" },
+        to: { type: "string", description: "End date, inclusive, format YYYY-MM-DD" },
+      },
+      required: ["from", "to"],
     },
-    required: ["from", "to"],
   },
 };
 
 const RETURNS_CANCELLED_TOOL = {
-  name: "get_returns_and_cancelled",
-  description: "Fetches the live, order-level list of returns (shipped then refunded) and cancellations (never shipped) for one calendar month, with order numbers and values. Use this for any question about returns/refunds/cancellations, including which specific orders were involved — the dashboard snapshot only has a single 90-day rate, not order-level detail or other months.",
-  input_schema: {
-    type: "object",
-    properties: {
-      month: { type: "string", description: "Calendar month, format YYYY-MM" },
+  type: "function",
+  function: {
+    name: "get_returns_and_cancelled",
+    description: "Fetches the live, order-level list of returns (shipped then refunded) and cancellations (never shipped) for one calendar month, with order numbers and values. Use this for any question about returns/refunds/cancellations, including which specific orders were involved — the dashboard snapshot only has a single 90-day rate, not order-level detail or other months.",
+    parameters: {
+      type: "object",
+      properties: {
+        month: { type: "string", description: "Calendar month, format YYYY-MM" },
+      },
+      required: ["month"],
     },
-    required: ["month"],
   },
 };
 
 const CALENDAR_TOOL = {
-  name: "get_calendar_events",
-  description: "Fetches real Calendar cards (tasks, meetings, reminders, events — not sales targets) for a specific date range from the company calendar. Use this for any question about what's scheduled, planned, or happening on specific dates.",
-  input_schema: {
-    type: "object",
-    properties: {
-      from: { type: "string", description: "Start date, inclusive, format YYYY-MM-DD" },
-      to: { type: "string", description: "End date, inclusive, format YYYY-MM-DD" },
+  type: "function",
+  function: {
+    name: "get_calendar_events",
+    description: "Fetches real Calendar cards (tasks, meetings, reminders, events — not sales targets) for a specific date range from the company calendar. Use this for any question about what's scheduled, planned, or happening on specific dates.",
+    parameters: {
+      type: "object",
+      properties: {
+        from: { type: "string", description: "Start date, inclusive, format YYYY-MM-DD" },
+        to: { type: "string", description: "End date, inclusive, format YYYY-MM-DD" },
+      },
+      required: ["from", "to"],
     },
-    required: ["from", "to"],
   },
 };
 
 const ANNOUNCEMENTS_TOOL = {
-  name: "get_announcements",
-  description: "Fetches real company announcements/bulletin posts (title, message, category, pinned status, posted date). Defaults to only currently-active (non-expired) ones. Use this for any question about announcements, promos, or policies that were posted.",
-  input_schema: {
-    type: "object",
-    properties: {
-      includeExpired: { type: "boolean", description: "Set true to also include expired announcements. Defaults to false." },
+  type: "function",
+  function: {
+    name: "get_announcements",
+    description: "Fetches real company announcements/bulletin posts (title, message, category, pinned status, posted date). Defaults to only currently-active (non-expired) ones. Use this for any question about announcements, promos, or policies that were posted.",
+    parameters: {
+      type: "object",
+      properties: {
+        includeExpired: { type: "boolean", description: "Set true to also include expired announcements. Defaults to false." },
+      },
     },
   },
 };
 
-// One retry on a 429/5xx (covers the "Overloaded" 529 Anthropic returns
-// under load) — everything else (bad request, auth) fails immediately since
-// retrying won't change the outcome.
-async function callAnthropic(payload, apiKey) {
+// One retry on a 429/5xx — everything else (bad request, auth) fails
+// immediately since retrying won't change the outcome.
+async function callRootsys(payload, apiKey) {
   for (let attempt = 0; attempt < 2; attempt++) {
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
+    const res = await fetch("https://rootsys.cloud/v1/chat/completions", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
+        Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify(payload),
     });
@@ -343,7 +365,7 @@ async function callAnthropic(payload, apiKey) {
       continue;
     }
     const text = await res.text().catch(() => "");
-    throw new Error(`Claude API error ${res.status}: ${text}`);
+    throw new Error(`rootsys.cloud API error ${res.status}: ${text}`);
   }
 }
 
@@ -417,27 +439,15 @@ async function runTool(call, idToken, env) {
   throw new Error(`Unknown tool: ${call.name}`);
 }
 
-async function askClaude(question, history, dashboardData, liveToday, idToken, apiKey, env) {
+async function askAssistant(question, history, dashboardData, liveToday, idToken, apiKey, env) {
   const todayMYT = new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString().slice(0, 10);
-  const messages = [
-    ...(history || []).map((m) => ({ role: m.role, content: m.content })),
-    { role: "user", content: question },
-  ];
 
-  // Split into blocks ordered stable -> volatile, with cache_control on the
-  // two that are worth caching. Prompt caching is a PREFIX match -- anything
-  // after a changed block can't hit cache -- so the least-often-changing
-  // content has to come first:
-  //   1. instructions/business context -- only changes when this file is
-  //      edited and redeployed; cached with a 1h TTL.
-  //   2. dashboard snapshot -- only changes when sync.js's full sync runs
-  //      (roughly daily); cached with the default 5m TTL, so bursts of
-  //      questions against the same snapshot mostly hit cache without
-  //      paying to keep an hour of a soon-to-be-stale snapshot alive.
-  //   3. live-today -- changes every couple of minutes; never cached,
-  //      always sent fresh, and it's small so the token cost is trivial.
-  // See shared/prompt-caching.md -- this is the standard "frozen prefix,
-  // volatile suffix" placement pattern.
+  // Anthropic's `system` param + cache_control-based prompt caching (frozen
+  // prefix / volatile suffix, see the old shared/prompt-caching.md note) had
+  // no equivalent confirmed on rootsys.cloud, so this is now a single system
+  // message like any OpenAI-compatible call -- every question re-sends the
+  // full dashboard snapshot, no caching discount. Content/ordering otherwise
+  // unchanged from the Anthropic version.
   const instructions = `You are a business analyst assistant for Gearevo, a Malaysian knife/gear retailer selling through Shopify, Shopee, and TikTok Shop. You're answering questions from Gearevo's own staff about their business data, shown inside their internal dashboard.
 
 ${BUSINESS_CONTEXT}
@@ -450,60 +460,59 @@ You are given a snapshot of the dashboard's current data as JSON, covering the l
 - Returns, refunds, or cancellations — especially order-level detail or any month other than a rolling 90-day rate → get_returns_and_cancelled.
 - What's on the calendar (tasks, meetings, reminders, events) for specific dates → get_calendar_events.
 - Company announcements/bulletin posts → get_announcements.
-Combine tools if a question needs more than one. Answer using only real data (the snapshot, the live-today block, or a tool result) — never invent figures, trends, product names, or calendar/announcement content. If something genuinely can't be answered (e.g. a metric with no historical tracking at all, like stock levels from months ago), say so plainly rather than guessing. Keep answers concise and business-focused, in plain English. Use RM for currency figures, formatted to 2 decimal places.`;
+Combine tools if a question needs more than one. Answer using only real data (the snapshot, the live-today block, or a tool result) — never invent figures, trends, product names, or calendar/announcement content. If something genuinely can't be answered (e.g. a metric with no historical tracking at all, like stock levels from months ago), say so plainly rather than guessing. Keep answers concise and business-focused, in plain English. Use RM for currency figures, formatted to 2 decimal places.
 
-  const system = [
-    { type: "text", text: instructions, cache_control: { type: "ephemeral", ttl: "1h" } },
-    {
-      type: "text",
-      text: `Dashboard snapshot (90-day/this-month window):\n${JSON.stringify(dashboardData)}`,
-      cache_control: { type: "ephemeral" },
-    },
-    { type: "text", text: `Live today (always current):\n${JSON.stringify(liveToday)}` },
+Dashboard snapshot (90-day/this-month window):
+${JSON.stringify(dashboardData)}
+
+Live today (always current):
+${JSON.stringify(liveToday)}`;
+
+  const messages = [
+    { role: "system", content: instructions },
+    ...(history || []).map((m) => ({ role: m.role, content: m.content })),
+    { role: "user", content: question },
   ];
 
-  // Agentic loop: Claude may ask for a tool, we run it and feed the result
-  // back, repeat until it gives a final text answer. Capped so a stuck model
-  // can't loop forever.
+  // Agentic loop: the assistant may ask for a tool, we run it and feed the
+  // result back, repeat until it gives a final text answer. Capped so a
+  // stuck model can't loop forever.
   for (let round = 0; round < 4; round++) {
-    const body = await callAnthropic({
-      model: "claude-sonnet-5",
+    const body = await callRootsys({
+      model: "fiq/hy3-tencent",
       max_tokens: 1024,
-      system,
       tools: [SALES_RANGE_TOOL, CHANNEL_REGION_TOOL, RETURNS_CANCELLED_TOOL, CALENDAR_TOOL, ANNOUNCEMENTS_TOOL],
       messages,
     }, apiKey);
 
-    // Best-effort visibility into whether caching is actually landing --
-    // check `wrangler tail` for this if cache_read_input_tokens stays 0
-    // across back-to-back questions when it shouldn't.
     if (body.usage) {
-      console.log(`Cache: read=${body.usage.cache_read_input_tokens || 0} write=${body.usage.cache_creation_input_tokens || 0} fresh=${body.usage.input_tokens || 0}`);
+      console.log(`Usage: prompt=${body.usage.prompt_tokens || 0} completion=${body.usage.completion_tokens || 0} cost=${body.usage.cost ?? "?"}`);
     }
 
-    const toolUses = (body.content || []).filter((b) => b.type === "tool_use");
-    if (body.stop_reason === "tool_use" && toolUses.length) {
-      messages.push({ role: "assistant", content: body.content });
-      const toolResults = [];
-      for (const call of toolUses) {
+    const message = body.choices?.[0]?.message;
+    const toolCalls = message?.tool_calls || [];
+    if (toolCalls.length) {
+      // OpenAI-style: echo the assistant's tool_calls back verbatim, then one
+      // role:"tool" message per call (not Anthropic's single combined
+      // tool_result-blocks message).
+      messages.push({ role: "assistant", content: message.content ?? null, tool_calls: toolCalls });
+      for (const tc of toolCalls) {
         let resultPayload;
         try {
-          resultPayload = await runTool(call, idToken, env);
+          const input = JSON.parse(tc.function.arguments || "{}");
+          resultPayload = await runTool({ name: tc.function.name, input }, idToken, env);
         } catch (e) {
           resultPayload = { error: e.message || "Lookup failed" };
         }
-        toolResults.push({ type: "tool_result", tool_use_id: call.id, content: JSON.stringify(resultPayload) });
+        messages.push({ role: "tool", tool_call_id: tc.id, content: JSON.stringify(resultPayload) });
       }
-      messages.push({ role: "user", content: toolResults });
       continue;
     }
 
-    const textBlock = (body.content || []).find((b) => b.type === "text");
-    if (!textBlock) {
-      const blockTypes = (body.content || []).map((b) => b.type).join(",") || "none";
-      throw new Error(`No text block in Claude response (stop_reason: ${body.stop_reason}, blocks: ${blockTypes})`);
+    if (!message?.content) {
+      throw new Error(`No content in assistant response (finish_reason: ${body.choices?.[0]?.finish_reason})`);
     }
-    return textBlock.text;
+    return message.content;
   }
   throw new Error("Assistant made too many tool calls without answering.");
 }
@@ -792,7 +801,7 @@ export default {
 
     try {
       const liveToday = await fetchGearevoTodayLive();
-      const reply = await askClaude(question, body.history, firestoreResult.data, liveToday, idToken, env.ANTHROPIC_API_KEY, env);
+      const reply = await askAssistant(question, body.history, firestoreResult.data, liveToday, idToken, env.ROOTSYS_API_KEY, env);
       return jsonResponse({ reply });
     } catch (e) {
       return jsonResponse({ error: e.message || "Chat failed." }, 500);

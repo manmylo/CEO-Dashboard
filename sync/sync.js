@@ -10,7 +10,8 @@
  *   SHOP_DOMAIN, SHOP_TOKEN, SHOP_API_VERSION (e.g. 2026-01),
  *   FIREBASE_SA,
  *   EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, EMAILJS_PUBLIC_KEY, EMAILJS_PRIVATE_KEY, REPORT_TO
- *   ANTHROPIC_API_KEY (optional — AI-generated advisor insights; falls back to
+ *   ROOTSYS_API_KEY (optional — AI-generated advisor insights via rootsys.cloud's
+ *   OpenAI-compatible endpoint, model fiq/hy3-tencent; falls back to
  *   rule-based buildInsights() if unset or the call fails)
  *
  * The monthly sales target is NOT an env var — it's set by staff via a
@@ -20,7 +21,7 @@
  */
 
 import admin from "firebase-admin";
-import Anthropic from "@anthropic-ai/sdk";
+import OpenAI from "openai";
 import crypto from "crypto";
 import { isExcluded, isExcludedTitle, getServiceCategory } from "./excluded-skus.js";
 import { graphql, paginate, getRestockDates } from "./restock-lookup.js";
@@ -928,22 +929,24 @@ function computeBusinessAnalysis({ dailyTrend, monthlyOrderTrend, deadStock, sto
 // the rule-based insights (already computed) if the key isn't configured or
 // the call fails — the sync never breaks because of an AI outage.
 async function generateAIInsights(context) {
-  if (!process.env.ANTHROPIC_API_KEY) {
-    console.log("AI insights skipped (ANTHROPIC_API_KEY not configured).");
+  if (!process.env.ROOTSYS_API_KEY) {
+    console.log("AI insights skipped (ROOTSYS_API_KEY not configured).");
     return null;
   }
 
   try {
-    const anthropic = new Anthropic();
-    const response = await anthropic.messages.create({
-      model: "claude-opus-4-8",
-      // 1024 was too tight once thinking tokens (adaptive) share this same
-      // budget — could truncate the JSON output mid-string before it
-      // finished (same failure mode already fixed in generateStrategicAnalysis
-      // below by raising its max_tokens; applying the same fix here).
+    const rootsys = new OpenAI({ baseURL: "https://rootsys.cloud/v1", apiKey: process.env.ROOTSYS_API_KEY });
+    const response = await rootsys.chat.completions.create({
+      model: "fiq/hy3-tencent",
+      // 1024 was too tight once reasoning tokens share this same budget --
+      // could truncate the JSON output mid-string before it finished (same
+      // failure mode already fixed in generateStrategicAnalysis below by
+      // raising its max_tokens; applying the same fix here).
       max_tokens: 4096,
-      thinking: { type: "adaptive" },
-      system: `You are a business advisor (Chief Data Officer) for Gearevo, a knife/gear retailer in Malaysia selling through Shopify, Shopee, and TikTok Shop.
+      messages: [
+        {
+          role: "system",
+          content: `You are a business advisor (Chief Data Officer) for Gearevo, a knife/gear retailer in Malaysia selling through Shopify, Shopee, and TikTok Shop.
 
 ${BUSINESS_CONTEXT}
 
@@ -958,13 +961,17 @@ Strict rules:
 - Keep each sentence short (1-2 sentences), including a suggested action where relevant.
 - Also mention something positive if there is one, not just problems.
 - All figures below (yesterday, mtdThroughYesterday, weekOverWeek) are through the end of asOfDate, a fully completed day — NOT a live, still-accumulating "today." Phrase observations that way (e.g. "jualan MTD sehingga [date]" or "jualan semalam"), never as "setakat ini hari ini" or "buat masa ini."`,
-      messages: [{
-        role: "user",
-        content: `Gearevo business data as of the end of ${context.asOfDate}:\n\n${JSON.stringify(context, null, 2)}`,
-      }],
-      output_config: {
-        format: {
-          type: "json_schema",
+        },
+        {
+          role: "user",
+          content: `Gearevo business data as of the end of ${context.asOfDate}:\n\n${JSON.stringify(context, null, 2)}`,
+        },
+      ],
+      response_format: {
+        type: "json_schema",
+        json_schema: {
+          name: "insights",
+          strict: true,
           schema: {
             type: "object",
             properties: { insights: { type: "array", items: { type: "string" } } },
@@ -975,12 +982,12 @@ Strict rules:
       },
     });
 
-    const textBlock = response.content.find((b) => b.type === "text");
-    if (!textBlock) {
-      console.log(`AI insights skipped: no text block in response (stop_reason: ${response.stop_reason}), using rule-based fallback.`);
+    const content = response.choices?.[0]?.message?.content;
+    if (!content) {
+      console.log(`AI insights skipped: no content in response (finish_reason: ${response.choices?.[0]?.finish_reason}), using rule-based fallback.`);
       return null;
     }
-    const parsed = JSON.parse(textBlock.text);
+    const parsed = JSON.parse(content);
     if (!parsed || !Array.isArray(parsed.insights) || !parsed.insights.length) {
       console.log(`AI insights skipped: response had no usable "insights" array, using rule-based fallback.`);
       return null;
@@ -1000,15 +1007,17 @@ Strict rules:
 // if the key isn't configured or the call fails, the tab just omits the
 // narrative and shows the data/charts on their own.
 async function generateStrategicAnalysis(context) {
-  if (!process.env.ANTHROPIC_API_KEY) return null;
+  if (!process.env.ROOTSYS_API_KEY) return null;
 
   try {
-    const anthropic = new Anthropic();
-    const response = await anthropic.messages.create({
-      model: "claude-opus-4-8",
+    const rootsys = new OpenAI({ baseURL: "https://rootsys.cloud/v1", apiKey: process.env.ROOTSYS_API_KEY });
+    const response = await rootsys.chat.completions.create({
+      model: "fiq/hy3-tencent",
       max_tokens: 4096,
-      thinking: { type: "adaptive" },
-      system: `You are the Managing Director of Gearevo, a knife/gear retailer in Malaysia selling through Shopify, Shopee, and TikTok Shop. You are reviewing this snapshot to decide what to do next — not to describe the numbers, but to act on them.
+      messages: [
+        {
+          role: "system",
+          content: `You are the Managing Director of Gearevo, a knife/gear retailer in Malaysia selling through Shopify, Shopee, and TikTok Shop. You are reviewing this snapshot to decide what to do next — not to describe the numbers, but to act on them.
 
 ${BUSINESS_CONTEXT}
 
@@ -1032,13 +1041,17 @@ Strict rules:
 - Only use the numbers given. DO NOT invent figures, trends, or product/customer names that aren't in the data.
 - Be honest if the data shows risk — don't be overly positive if the numbers don't support it. Equally, don't manufacture urgency out of a single noisy data point.
 - Don't repeat the same sentence format as the daily tactical report ("Recommendations") — this should read like an executive is deciding, not a dashboard summarizing.`,
-      messages: [{
-        role: "user",
-        content: `Gearevo business analysis data (snapshot ${context.date}):\n\n${JSON.stringify(context, null, 2)}`,
-      }],
-      output_config: {
-        format: {
-          type: "json_schema",
+        },
+        {
+          role: "user",
+          content: `Gearevo business analysis data (snapshot ${context.date}):\n\n${JSON.stringify(context, null, 2)}`,
+        },
+      ],
+      response_format: {
+        type: "json_schema",
+        json_schema: {
+          name: "analysis",
+          strict: true,
           schema: {
             type: "object",
             properties: { analysis: { type: "array", items: { type: "string" } } },
@@ -1049,12 +1062,12 @@ Strict rules:
       },
     });
 
-    const textBlock = response.content.find((b) => b.type === "text");
-    if (!textBlock) {
-      console.log(`Strategic analysis skipped: no text block in response (stop_reason: ${response.stop_reason}).`);
+    const content = response.choices?.[0]?.message?.content;
+    if (!content) {
+      console.log(`Strategic analysis skipped: no content in response (finish_reason: ${response.choices?.[0]?.finish_reason}).`);
       return null;
     }
-    const parsed = JSON.parse(textBlock.text);
+    const parsed = JSON.parse(content);
     if (!parsed || !Array.isArray(parsed.analysis) || !parsed.analysis.length) {
       console.log(`Strategic analysis skipped: response had no usable "analysis" array.`);
       return null;

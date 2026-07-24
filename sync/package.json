@@ -8,7 +8,7 @@
     "check-restock": "node check-restock.js"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.110.0",
-    "firebase-admin": "^12.7.0"
+    "firebase-admin": "^12.7.0",
+    "openai": "^6.49.0"
   }
 }
