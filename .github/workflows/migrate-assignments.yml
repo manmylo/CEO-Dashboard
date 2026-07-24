@@ -1,0 +1,26 @@
+name: Migrate assignments to multi-assignee (one-time)
+
+on:
+  workflow_dispatch: {}
+
+# Run this BEFORE deploying the new firestore.rules that require assignedTo
+# to be a list -- see migrate-assignments.js for why. Safe to re-run.
+jobs:
+  migrate-assignments:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install deps
+        working-directory: sync
+        run: npm install
+
+      - name: Migrate assignments
+        working-directory: sync
+        env:
+          FIREBASE_SA: ${{ secrets.FIREBASE_SA }}
+        run: node migrate-assignments.js
