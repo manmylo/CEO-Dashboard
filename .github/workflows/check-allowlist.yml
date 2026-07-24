@@ -1,0 +1,26 @@
+name: Check allowlist (diagnostic)
+
+on:
+  workflow_dispatch: {}
+
+# Read-only dump of config/access.allowedEmails -- no writes, nothing else
+# touched. See check-allowlist.js for why.
+jobs:
+  check-allowlist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install deps
+        working-directory: sync
+        run: npm install
+
+      - name: Check allowlist
+        working-directory: sync
+        env:
+          FIREBASE_SA: ${{ secrets.FIREBASE_SA }}
+        run: node check-allowlist.js
