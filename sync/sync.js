@@ -67,13 +67,24 @@ const BASKET_MAX_PAIRS = 15;    // cap on how many "frequently bought together" 
 // one product." Derived from the actual gearevo.com collection catalog
 // (2026-07). Update this note (not code logic) if the catalog or promo
 // calendar changes.
+//
+// Eid Adha's Gregorian date is given explicitly (not left for the model to
+// guess) because it's a lunar-calendar holiday that shifts ~11 days earlier
+// every Gregorian year -- without a real date, the model has no way to know
+// whether asOfDate (given in the user turn) falls before, during, or months
+// after it, and was observed calling a report "before Raya Korban" when
+// asOfDate was actually ~2 months AFTER it had already passed. The explicit
+// "only mention it if asOfDate is actually near it" rule is what prevents
+// that -- MUST be re-dated every year, this is not a fixed calendar day.
 const BUSINESS_CONTEXT = `Gearevo sells across several distinct categories, not just butcher knives: (1) Kitchen & butcher knives/tools — knives, cleavers, boning/skinning tools, kitchen sets (F. Herder, Giesser, F. Dick, Victorinox Butcher, Wüsthof, Pirge, Icel, Swibo); (2) EDC & outdoor knives — folding/survival knives (Spyderco, Benchmade, CRKT, Kershaw, Civivi, Cold Steel, and more); (3) Parangs/machetes, a distinct Malaysian-market category; (4) sharpening tools and services (stones, sharpeners, honing rods, a sharpening class); (5) sheaths and carry gear (custom/ready-made Kydex, bags, cases).
 
 Sales are NOT flat year-round — there's a real promotional/seasonal calendar:
-- Eid Adha (Hari Raya Haji / Qurban / "Raya Korban") drives a hard spike in butcher/slaughter knife sales, followed by 1-2 months of tiered post-season clearance sales. A spike in butcher-knife sales/concentration around this time, or a drop afterward, is EXPECTED, not a red flag.
-- The store also runs recurring PAYDAY SALES (tied to Malaysian salary payout dates, roughly monthly) plus Merdeka Day (Aug 31) and Christmas promotions. A short-term order/sales spike may simply be one of these routine promo events, not organic growth, a one-off anomaly, or a structural risk — don't over-read a single promotional month.
+- Eid Adha (Hari Raya Haji / Qurban / "Raya Korban") drives a hard spike in butcher/slaughter knife sales, followed by 1-2 months of tiered post-season clearance sales. Eid Adha 2026 falls around 27 May 2026 (±1 day for moon sighting) — it is a LUNAR calendar holiday and moves ~11 days earlier every Gregorian year, so this exact date applies to 2026 ONLY and must not be reused for other years. A spike in butcher-knife sales/concentration in the weeks before that date, or a drop in the 1-2 months after, is EXPECTED, not a red flag.
+- The store also runs recurring PAYDAY SALES (tied to Malaysian salary payout dates, roughly monthly) plus Merdeka Day (Aug 31, fixed every year) and Christmas promotions. A short-term order/sales spike may simply be one of these routine promo events, not organic growth, a one-off anomaly, or a structural risk — don't over-read a single promotional month.
 
-When you see a spike or drop that could be tied to any of the above (Eid Adha, a payday sale, Merdeka, Christmas, or post-season clearance), say so explicitly rather than treating it as a structural risk, decline, or a problem to fix.`;
+CRITICAL: before mentioning Eid Adha/Raya Korban at all, compare it against asOfDate (given in the data below). Only reference it if asOfDate actually falls within its run-up (roughly 6 weeks before) or its 1-2 month post-season clearance window. If asOfDate is well before or well after that window, do NOT call the current period "before Raya Korban" or otherwise imply it's imminent or ongoing — instead name whichever period actually matches asOfDate (a payday sale, Merdeka, Christmas, or just normal trading with no seasonal event nearby).
+
+When you see a spike or drop that could be tied to any of the above (Eid Adha, a payday sale, Merdeka, Christmas, or post-season clearance) AND the timing genuinely lines up with asOfDate, say so explicitly rather than treating it as a structural risk, decline, or a problem to fix.`;
 
 // Ending inventory retail value only (not margin/dead-stock) — mirrors the
 // ShopifyQL query behind Shopify Analytics' own inventory report:
