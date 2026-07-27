@@ -9,7 +9,8 @@
  * Env (GitHub repo Secrets):
  *   SHOP_DOMAIN, SHOP_TOKEN, SHOP_API_VERSION (e.g. 2026-01),
  *   FIREBASE_SA,
- *   EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, EMAILJS_PUBLIC_KEY, EMAILJS_PRIVATE_KEY, REPORT_TO
+ *   EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, EMAILJS_PUBLIC_KEY, EMAILJS_PRIVATE_KEY
+ *   (daily-report recipients are config/access.reportRecipients, managed from the Access page -- not a secret)
  *   ROOTSYS_API_KEY (optional — AI-generated advisor insights via rootsys.cloud's
  *   OpenAI-compatible endpoint, model fiq/hy3-tencent; falls back to
  *   rule-based buildInsights() if unset or the call fails)
@@ -143,20 +144,12 @@ async function releaseLock() {
   await db.doc("sync/lock").set({ lockedAt: null }, { merge: true });
 }
 
-// ---------- dashboard access allowlist ----------
-// Firestore rules check email membership against config/access, not a
-// hardcoded list in firestore.rules, since that file is committed to a
-// public repo. The real list lives only in this GitHub Actions secret.
-async function syncAllowlist() {
-  const raw = process.env.ALLOWED_EMAILS;
-  if (!raw) return; // secret not set yet — don't wipe an existing allowlist
-  const allowedEmails = raw.split(",").map((e) => e.trim().toLowerCase()).filter(Boolean);
-  if (!allowedEmails.length) return;
-  // merge:true -- this doc also carries an `admins` field (who can manage
-  // per-user page access), seeded once via sync/seed-admin.js, not from this
-  // secret. A plain .set() here would silently wipe it on every sync tick.
-  await db.doc("config/access").set({ allowedEmails, updatedAt: new Date().toISOString() }, { merge: true });
-}
+// The login allowlist (config/access.allowedEmails) used to be synced here
+// from an ALLOWED_EMAILS GitHub Actions secret every run. It's now managed
+// directly from the Access page (admin-only) instead, so an admin can
+// add/remove staff without touching GitHub at all -- see firestore.rules'
+// config/access update rule. The ALLOWED_EMAILS secret is unused as of this
+// change and can be deleted from the repo's GitHub Actions secrets.
 
 // graphql()/paginate() (Shopify GraphQL helper + cursor pagination) now live
 // in restock-lookup.js (imported above), shared with check-restock.js.
@@ -1099,8 +1092,19 @@ Strict rules:
 // Sent at 8am MYT, so "today" is barely a few hours old — the report is about
 // YESTERDAY's finished day (from daily/{yesterday}), not the in-progress today.
 async function sendEmail(m, yesterday) {
-  const { EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, EMAILJS_PUBLIC_KEY, EMAILJS_PRIVATE_KEY, REPORT_TO } = process.env;
-  if (!EMAILJS_SERVICE_ID || !REPORT_TO) { console.log("Email skipped (not configured)."); return; }
+  const { EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, EMAILJS_PUBLIC_KEY, EMAILJS_PRIVATE_KEY } = process.env;
+  if (!EMAILJS_SERVICE_ID) { console.log("Email skipped (not configured)."); return; }
+
+  // Recipients used to be a single REPORT_TO GitHub Actions secret -- now
+  // managed from the Access page instead (config/access.reportRecipients),
+  // same reasoning as the allowedEmails move: an admin shouldn't need
+  // GitHub access to add/remove who gets the report. Not required to be a
+  // subset of allowedEmails -- someone can receive the report with no
+  // dashboard login at all.
+  const accessSnap = await db.doc("config/access").get();
+  const reportRecipients = (accessSnap.exists ? accessSnap.data().reportRecipients : []) || [];
+  if (!reportRecipients.length) { console.log("Email skipped (no report recipients configured)."); return; }
+  const [to_email, ...bccList] = reportRecipients;
 
   const topMTD = m.topProductsMTD?.[0] || m.topProducts?.[0]; // fall back for older cached metrics
   const changeStr = yesterday.changePct == null ? "" :
@@ -1150,7 +1154,7 @@ async function sendEmail(m, yesterday) {
     body: JSON.stringify({
       service_id: EMAILJS_SERVICE_ID, template_id: EMAILJS_TEMPLATE_ID,
       user_id: EMAILJS_PUBLIC_KEY, accessToken: EMAILJS_PRIVATE_KEY,
-      template_params: { to_email: REPORT_TO, subject: `Gearevo Report ${yesterday.date}`, message: body, header: "DAILY REPORT",
+      template_params: { to_email, bcc_emails: bccList.join(","), subject: `Gearevo Report ${yesterday.date}`, message: body, header: "DAILY REPORT",
         link: "https://ceo-dashboard-9e9b4.web.app/index.html", link_label: "Open Dashboard" },
     }),
   });
@@ -1527,8 +1531,6 @@ async function sendDailyEmailIfDue(freshMetrics, force) {
   }
 
   try {
-    await syncAllowlist();
-
     if (process.env.FORCE_BACKFILL === "true") {
       console.log("Mode: BACKFILL (from sales dashboard) — skipping Shopify + email.");
       await runBackfillFromDashboard();

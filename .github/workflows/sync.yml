@@ -57,12 +57,10 @@ jobs:
           EMAILJS_TEMPLATE_ID: ${{ secrets.EMAILJS_TEMPLATE_ID }}
           EMAILJS_PUBLIC_KEY: ${{ secrets.EMAILJS_PUBLIC_KEY }}
           EMAILJS_PRIVATE_KEY: ${{ secrets.EMAILJS_PRIVATE_KEY }}
-          REPORT_TO: ${{ secrets.REPORT_TO }}
           FORCE_FULL: ${{ github.event.inputs.full }}
           FORCE_EMAIL: ${{ github.event.inputs.test_email }}
           FORCE_BACKFILL: ${{ github.event.inputs.backfill }}
           ROOTSYS_API_KEY: ${{ secrets.ROOTSYS_API_KEY }}
-          ALLOWED_EMAILS: ${{ secrets.ALLOWED_EMAILS }}
           SHOPEE_PARTNER_ID: ${{ secrets.SHOPEE_PARTNER_ID }}
           SHOPEE_PARTNER_KEY: ${{ secrets.SHOPEE_PARTNER_KEY }}
           SHOPEE_SHOP_ID: ${{ secrets.SHOPEE_SHOP_ID }}

@@ -70,7 +70,7 @@ can only show revenue, not untung. Fill these in first for your active SKUs.
    | `SHOP_TOKEN` | shpat_... |
    | `SHOP_API_VERSION` | 2026-01 |
    | `FIREBASE_SA` | the one-line service-account JSON |
-   | `EMAILJS_*`, `REPORT_TO` | optional (see Step 5) |
+   | `EMAILJS_*` | optional (see Step 5) |
 
    The monthly sales target is **not** a secret — set it by dragging a
    Target card onto the current month in the dashboard's Calendar (Year
@@ -122,7 +122,8 @@ Copy the printed `*.workers.dev` URL into `CHATBOT_WORKER_URL` near the top of
 2. **Account → Security → enable "Allow EmailJS API for non-browser applications"**
    (required to send from GitHub Actions).
 3. Add secrets `EMAILJS_SERVICE_ID`, `EMAILJS_TEMPLATE_ID`, `EMAILJS_PUBLIC_KEY`,
-   `EMAILJS_PRIVATE_KEY`, `REPORT_TO`.
+   `EMAILJS_PRIVATE_KEY`. Recipients are **not** a secret — set them from the
+   dashboard's Access page (admin-only), not GitHub.
    Free tier = 200 emails/month (daily report = ~30). Cukup.
 
 ---
