@@ -1091,19 +1091,23 @@ Strict rules:
 // ---------- email (EmailJS, server-side) ----------
 // Sent at 8am MYT, so "today" is barely a few hours old — the report is about
 // YESTERDAY's finished day (from daily/{yesterday}), not the in-progress today.
+// Returns whether an email was actually sent -- sendDailyEmailIfDue() below
+// only marks the day as done when this is true, so an empty-recipients (or
+// unconfigured-EmailJS) run doesn't get silently marked "sent" for the day
+// and then skip the real send once recipients are actually ticked later.
 async function sendEmail(m, yesterday) {
   const { EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, EMAILJS_PUBLIC_KEY, EMAILJS_PRIVATE_KEY } = process.env;
-  if (!EMAILJS_SERVICE_ID) { console.log("Email skipped (not configured)."); return; }
+  if (!EMAILJS_SERVICE_ID) { console.log("Email skipped (not configured)."); return false; }
 
   // Recipients used to be a single REPORT_TO GitHub Actions secret -- now
   // managed from the Access page instead (config/access.reportRecipients),
   // same reasoning as the allowedEmails move: an admin shouldn't need
-  // GitHub access to add/remove who gets the report. Not required to be a
-  // subset of allowedEmails -- someone can receive the report with no
-  // dashboard login at all.
+  // GitHub access to add/remove who gets the report. Only ever people
+  // already on allowedEmails -- the Access page's tick list is the only way
+  // to add someone here.
   const accessSnap = await db.doc("config/access").get();
   const reportRecipients = (accessSnap.exists ? accessSnap.data().reportRecipients : []) || [];
-  if (!reportRecipients.length) { console.log("Email skipped (no report recipients configured)."); return; }
+  if (!reportRecipients.length) { console.log("Email skipped (no report recipients configured)."); return false; }
   const [to_email, ...bccList] = reportRecipients;
 
   const topMTD = m.topProductsMTD?.[0] || m.topProducts?.[0]; // fall back for older cached metrics
@@ -1159,6 +1163,7 @@ async function sendEmail(m, yesterday) {
     }),
   });
   console.log(res.ok ? "Email sent." : `Email failed: ${res.status} ${await res.text()}`);
+  return res.ok;
 }
 
 // ---------- run modes ----------
@@ -1512,9 +1517,15 @@ async function sendDailyEmailIfDue(freshMetrics, force) {
   // Finished day vs. finished day — always a fair comparison, unlike "today" mid-day.
   yesterday.changePct = dayBeforeSales ? money(((yesterday.todaySales - dayBeforeSales) / dayBeforeSales) * 100) : null;
 
-  await sendEmail(metrics, yesterday);
+  const sent = await sendEmail(metrics, yesterday);
 
   if (force) { console.log("Email — forced test send."); return; }
+
+  // Only mark today done when an email actually went out -- otherwise a run
+  // with no recipients configured yet (or EmailJS unconfigured) would mark
+  // the day "sent" and permanently skip the real send once recipients are
+  // ticked later today, since this only ever fires once per MYT day.
+  if (!sent) { console.log("Email — not marking today done (nothing was actually sent)."); return; }
 
   const todayStr = myDateStr(new Date());
   await db.doc("sync/state").set({ lastEmailDate: todayStr }, { merge: true });
