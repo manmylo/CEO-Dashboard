@@ -14,6 +14,10 @@
  *   ROOTSYS_API_KEY (optional — AI-generated advisor insights via rootsys.cloud's
  *   OpenAI-compatible endpoint, model fiq/hy3-tencent; falls back to
  *   rule-based buildInsights() if unset or the call fails)
+ *   TIKTOK_ADVERTISER_ID (optional — TikTok Ads spend/sales/ROAS card; skipped
+ *   entirely if unset. The access token itself is NOT an env var -- it's
+ *   long-lived and seeded once into config/tiktokAuth via the "Seed TikTok
+ *   token" GitHub Action, see seed-tiktok-token.js)
  *
  * The monthly sales target is NOT an env var — it's set by staff via a
  * Target card dropped on the current month in the dashboard's Calendar
@@ -1312,6 +1316,89 @@ async function syncShopeeAds(scope = "month") {
   }
 }
 
+// ---------- TikTok Ads (Marketing API, report/integrated/get) ----------
+// config/tiktokAuth.accessToken is long-lived (seeded once via the "Seed
+// TikTok token" GitHub Action / seed-tiktok-token.js) -- unlike Shopee,
+// there's no daily/hourly refresh_token rotation needed here.
+// Metric field names confirmed live via check-tiktok-ads.js -- some
+// documented-sounding names are REJECTED by the actual API (roas,
+// shopping_roas, gross_revenue all failed); the ones actually used below
+// are confirmed working: spend, total_onsite_shopping_value (ad-attributed
+// sales), complete_payment (count of completed-payment conversion events --
+// the closest available stand-in for "orders via ads"; TikTok's Shop Ads
+// report has no confirmed item-quantity metric, unlike Shopee's
+// broad_item_sold).
+async function fetchTikTokAdsRange(accessToken, advertiserId, startDate, endDate) {
+  const url = new URL("https://business-api.tiktok.com/open_api/v1.3/report/integrated/get/");
+  url.searchParams.set("advertiser_id", advertiserId);
+  url.searchParams.set("report_type", "BASIC");
+  url.searchParams.set("data_level", "AUCTION_ADVERTISER");
+  url.searchParams.set("dimensions", JSON.stringify(["advertiser_id", "stat_time_day"]));
+  url.searchParams.set("metrics", JSON.stringify(["spend", "total_onsite_shopping_value", "complete_payment"]));
+  url.searchParams.set("start_date", startDate);
+  url.searchParams.set("end_date", endDate);
+  url.searchParams.set("page_size", "100");
+
+  const byDate = new Map();
+  const res = await fetch(url, { headers: { "Access-Token": accessToken } });
+  const data = await res.json();
+  if (data.code !== 0) {
+    console.log(`   TikTok ads range fetch (${startDate} -> ${endDate}) — ${JSON.stringify(data)}`);
+    return byDate;
+  }
+  // Days with zero ad activity aren't returned as rows at all (confirmed
+  // live -- a 14-day window with spend on only 6 of those days returned
+  // exactly 6 rows), so a missing day means genuinely no spend, not a
+  // fetch failure.
+  for (const row of data.data?.list || []) {
+    const dateStr = (row.dimensions.stat_time_day || "").slice(0, 10); // "YYYY-MM-DD 00:00:00" -> "YYYY-MM-DD"
+    const spend = Number(row.metrics.spend || 0);
+    const sales = Number(row.metrics.total_onsite_shopping_value || 0);
+    byDate.set(dateStr, {
+      adSpend: money(spend),
+      adSales: money(sales),
+      adOrders: Number(row.metrics.complete_payment || 0),
+      adRoas: spend ? money(sales / spend) : 0,
+    });
+  }
+  return byDate;
+}
+
+// Best-effort, matching syncShopeeAds()'s conventions exactly -- a TikTok
+// outage should never take down the actual sales sync. Writes to its own
+// tiktokAds/{date} collection. Same month/today scope split as Shopee ads
+// (see that function's comment) for the same reasons. TIKTOK_ADVERTISER_ID
+// unset just means the integration isn't configured yet -- skip quietly,
+// same treatment as EMAILJS_SERVICE_ID/ROOTSYS_API_KEY being optional.
+async function syncTikTokAds(scope = "month") {
+  const advertiserId = process.env.TIKTOK_ADVERTISER_ID;
+  if (!advertiserId) return;
+  try {
+    const authSnap = await db.doc("config/tiktokAuth").get();
+    const accessToken = authSnap.exists ? authSnap.data().accessToken : null;
+    if (!accessToken) { console.log("TikTok ads — no accessToken seeded yet, skipping."); return; }
+
+    const end = myDateStr(new Date());
+    const start = scope === "today" ? end : `${myMonthKey(new Date())}-01`;
+    const byDate = await fetchTikTokAdsRange(accessToken, advertiserId, start, end);
+    if (byDate.size === 0) {
+      console.log("TikTok ads — no data returned for the window, skipping writes.");
+      return;
+    }
+    let batch = db.batch();
+    let count = 0;
+    for (const [dateStr, ads] of byDate) {
+      batch.set(db.doc(`tiktokAds/${dateStr}`), { date: dateStr, ...ads, syncedAt: new Date().toISOString() }, { merge: true });
+      count++;
+      if (count >= 400) { await batch.commit(); batch = db.batch(); count = 0; }
+    }
+    if (count > 0) await batch.commit();
+    console.log(`TikTok ads — synced ${byDate.size} days.`);
+  } catch (e) {
+    console.error(`TikTok ads sync failed (non-fatal): ${e.message}`);
+  }
+}
+
 async function runFull() {
   const raw = await pull();
   const metrics = await compute(raw);
@@ -1428,6 +1515,7 @@ async function runFull() {
   console.log(`Full sync — dashboard/latest + ${dailyTrend.length} daily docs + ${latest.businessAnalysis.monthlyTrend.length} monthly docs.`);
 
   await syncShopeeAds();
+  await syncTikTokAds();
 
   return metrics;
 }
@@ -1474,6 +1562,7 @@ async function runQuick() {
   const inv = computeInventory(variantMap);
   await db.doc("dashboard/latest").set(inv, { merge: true });
   await syncShopeeAds("today"); // see syncShopeeAds()'s comment on scope
+  await syncTikTokAds("today");
   console.log(`Quick sync — inventory RM${inv.endingInventoryRetailValue}.`);
   return null;
 }
