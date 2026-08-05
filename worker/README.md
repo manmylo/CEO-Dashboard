@@ -12,7 +12,7 @@ since the order/month endpoints call Shopify directly.
 
 ## Endpoints
 
-- `POST /` — chat (rootsys.cloud, model `fiq/hy3-tencent`, using `dashboard/latest` as context).
+- `POST /` — chat (rootsys.cloud, model `hy3-tencent`, using `dashboard/latest` as context).
 - `POST /orders` — a single day's order-level breakdown (`{date}`), used by the
   Calendar's Target cards and the Home page's "Today's Sales" card.
 - `POST /month-orders` — a month's Returns/Cancelled lists + live product cost
@@ -29,7 +29,7 @@ since the order/month endpoints call Shopify directly.
    This opens a browser window to authorize the CLI against your Cloudflare account.
 3. From this `worker/` folder, set these secrets (never committed to git):
    ```bash
-   wrangler secret put ROOTSYS_API_KEY      # rootsys.cloud API key (model fiq/hy3-tencent)
+   wrangler secret put ROOTSYS_API_KEY      # rootsys.cloud API key (model hy3-tencent)
    wrangler secret put SHOP_DOMAIN          # e.g. gearevo.myshopify.com — same as sync.js's SHOP_DOMAIN
    wrangler secret put SHOP_TOKEN           # same Shopify Admin API token sync.js uses
    wrangler secret put SHOP_API_VERSION     # optional, e.g. 2026-01 — defaults to 2026-01 if unset

@@ -11,12 +11,26 @@
  *
  * Secrets (set via `wrangler secret put`):
  *   ROOTSYS_API_KEY -- rootsys.cloud's OpenAI-compatible endpoint, model
- *   fiq/hy3-tencent. Plain fetch (no SDK) against
+ *   hy3-tencent. Plain fetch (no SDK) against
  *   https://rootsys.cloud/v1/chat/completions, same as the previous
  *   Anthropic integration -- no need to bundle the openai npm package into
  *   this Worker just for one REST call.
  *   SHOP_DOMAIN, SHOP_TOKEN, SHOP_API_VERSION (optional, e.g. 2026-01) —
  *   same Shopify store/credentials sync.js uses, needed for POST /orders.
+ *   GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET, GOOGLE_OAUTH_REFRESH_TOKEN,
+ *   GOOGLE_DRIVE_FOLDER_ID (optional -- Assignment Sheet image attachments,
+ *   POST /attachments). Deliberately a REAL Google account's OAuth refresh
+ *   token, not a service account -- service accounts get ZERO Drive storage
+ *   quota outside a Shared Drive, and Shared Drives are a Google Workspace-
+ *   only feature this plain-Gmail setup doesn't have (learned the hard way:
+ *   every upload 403'd with "storageQuotaExceeded"). A real account's own
+ *   Drive has normal quota, so this refreshes a long-lived offline-access
+ *   token for one dedicated account instead and uploads into a folder in
+ *   THAT account's own Drive -- still one shared, staff-turnover-proof
+ *   location, just owned by a real account rather than a service identity.
+ *   GOOGLE_DRIVE_FOLDER_ID is that folder's ID (no sharing step needed --
+ *   the account already owns it outright). See getGoogleAccessToken()/
+ *   uploadToDrive() below.
  */
 
 const FIREBASE_PROJECT_ID = "ceo-dashboard-9e9b4";
@@ -534,7 +548,7 @@ ${JSON.stringify(liveToday)}`;
   // empty throughout, confirmed by testing), there's nothing to undo.
   for (let round = 0; round < 4; round++) {
     const stream = await streamRootsys({
-      model: "fiq/hy3-tencent",
+      model: "hy3-tencent",
       // hy3-tencent is a reasoning model -- left enabled, this turned a chat
       // reply into a ~60s round trip for no measurable quality gain
       // (verified: tool-calling and answer quality both held up fine with
@@ -794,6 +808,96 @@ async function fetchMonthOrderSummary(monthKey, env) {
   };
 }
 
+// ---- Google Drive attachments (Assignment Sheet) --------------------------
+// Refresh-token flow against a real Google account (see the file header
+// comment for why NOT a service account) -- standard OAuth2, no signing
+// needed, just exchange the long-lived refresh token for a short-lived
+// access token. Cached in module scope for the lifetime of this isolate --
+// avoids a token exchange round trip on every single upload, though a cold
+// start (fresh isolate) always gets a clean cache and just re-fetches.
+let cachedDriveToken = null; // { accessToken, expiresAt }
+async function getGoogleAccessToken(env) {
+  if (cachedDriveToken && cachedDriveToken.expiresAt > Date.now() + 30000) {
+    return cachedDriveToken.accessToken;
+  }
+  const res = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: env.GOOGLE_OAUTH_REFRESH_TOKEN,
+      client_id: env.GOOGLE_OAUTH_CLIENT_ID,
+      client_secret: env.GOOGLE_OAUTH_CLIENT_SECRET,
+    }),
+  });
+  if (!res.ok) throw new Error(`Google token refresh failed: ${await res.text().catch(() => "")}`);
+  const data = await res.json();
+  cachedDriveToken = { accessToken: data.access_token, expiresAt: Date.now() + data.expires_in * 1000 };
+  return cachedDriveToken.accessToken;
+}
+
+// Multipart upload (metadata JSON part + raw file bytes part) into the one
+// shared folder, then a permissions.create call to make that single file
+// link-viewable -- Drive files are private to their owner (the dedicated
+// storage account) by default, and every assignee/viewer needs to see the
+// image, not just whoever's credentials created it. imageUrl is built
+// directly from the file ID (lh3.googleusercontent.com/d/{id}) rather than
+// trusting the upload response's own thumbnailLink field -- that field is
+// only populated once Drive has actually generated a thumbnail, which
+// doesn't always happen by the time this response comes back (confirmed
+// live: came back empty right after upload), silently saving a blank
+// attachment. This URL renders on request instead of needing a pre-
+// generated thumbnail, AND stays on googleusercontent.com, which is the
+// only image host the page's CSP allows besides 'self'/data: -- Drive's own
+// domain (drive.google.com/thumbnail) is a similarly common pattern but
+// isn't covered by that allowlist and would silently fail to load.
+async function uploadToDrive(fileBuffer, filename, mimeType, accessToken, folderId) {
+  const boundary = `gearevo-${crypto.randomUUID()}`;
+  const metadata = JSON.stringify({ name: filename, parents: [folderId] });
+  const encoder = new TextEncoder();
+  const head = encoder.encode(
+    `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${metadata}\r\n` +
+    `--${boundary}\r\nContent-Type: ${mimeType}\r\n\r\n`
+  );
+  const tail = encoder.encode(`\r\n--${boundary}--`);
+  const body = new Blob([head, fileBuffer, tail]);
+
+  const uploadRes = await fetch(
+    "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,webViewLink",
+    { method: "POST", headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": `multipart/related; boundary=${boundary}` }, body }
+  );
+  if (!uploadRes.ok) throw new Error(`Drive upload failed: ${await uploadRes.text().catch(() => "")}`);
+  const file = await uploadRes.json();
+
+  const permRes = await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}/permissions`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ role: "reader", type: "anyone" }),
+  });
+  if (!permRes.ok) throw new Error(`Drive sharing failed: ${await permRes.text().catch(() => "")}`);
+
+  return {
+    fileId: file.id,
+    imageUrl: `https://lh3.googleusercontent.com/d/${file.id}=w1600`,
+    viewUrl: file.webViewLink || "",
+    name: filename,
+  };
+}
+
+// Called when Remove is hit on an already-saved attachment, or when it's
+// replaced by a new upload -- see assignments.js's save handler, which
+// compares the fileId the modal opened with against the one it's saving
+// and only calls this if that actually changed. 404 (already gone) is
+// treated as success, not an error -- the end state either way is "this
+// file doesn't exist," which is what was being asked for.
+async function deleteFromDrive(fileId, accessToken) {
+  const res = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  if (!res.ok && res.status !== 404) throw new Error(`Drive delete failed: ${await res.text().catch(() => "")}`);
+}
+
 async function verifyAuth(idToken) {
   const firestoreResult = await fetchDashboardLatest(idToken);
   return firestoreResult.ok;
@@ -812,14 +916,43 @@ export default {
     const idToken = authHeader.replace(/^Bearer\s+/i, "");
     if (!idToken) return jsonResponse({ error: "Missing Authorization header" }, 401);
 
+    const pathname = new URL(request.url).pathname;
+
+    // multipart/form-data, not JSON -- handled before the generic
+    // request.json() parse below, since a request body can only be read
+    // once and formData()/.json() aren't interchangeable.
+    if (pathname === "/attachments") {
+      if (!(await verifyAuth(idToken))) return jsonResponse({ error: "Not authorized." }, 403);
+      if (!env.GOOGLE_OAUTH_CLIENT_ID || !env.GOOGLE_OAUTH_CLIENT_SECRET || !env.GOOGLE_OAUTH_REFRESH_TOKEN || !env.GOOGLE_DRIVE_FOLDER_ID) {
+        return jsonResponse({ error: "Attachments aren't configured yet." }, 500);
+      }
+      let form;
+      try {
+        form = await request.formData();
+      } catch {
+        return jsonResponse({ error: "Invalid form data" }, 400);
+      }
+      const file = form.get("file");
+      if (!file || typeof file === "string") return jsonResponse({ error: "Missing file" }, 400);
+      const ALLOWED_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+      if (!ALLOWED_TYPES.has(file.type)) return jsonResponse({ error: "Only PNG/JPEG/WEBP/GIF images are allowed." }, 400);
+      if (file.size > 8 * 1024 * 1024) return jsonResponse({ error: "Image is too large (max 8MB)." }, 400);
+      try {
+        const accessToken = await getGoogleAccessToken(env);
+        const buffer = await file.arrayBuffer();
+        const result = await uploadToDrive(buffer, file.name || "attachment", file.type, accessToken, env.GOOGLE_DRIVE_FOLDER_ID);
+        return jsonResponse(result);
+      } catch (e) {
+        return jsonResponse({ error: e.message || "Upload failed." }, 500);
+      }
+    }
+
     let body;
     try {
       body = await request.json();
     } catch {
       return jsonResponse({ error: "Invalid JSON body" }, 400);
     }
-
-    const pathname = new URL(request.url).pathname;
 
     if (pathname === "/orders") {
       const date = (body.date || "").trim();
@@ -842,6 +975,22 @@ export default {
         return jsonResponse({ month, ...result });
       } catch (e) {
         return jsonResponse({ error: e.message || "Order lookup failed." }, 500);
+      }
+    }
+
+    if (pathname === "/attachments/delete") {
+      const fileId = (body.fileId || "").trim();
+      if (!fileId) return jsonResponse({ error: "Missing fileId" }, 400);
+      if (!(await verifyAuth(idToken))) return jsonResponse({ error: "Not authorized." }, 403);
+      if (!env.GOOGLE_OAUTH_CLIENT_ID || !env.GOOGLE_OAUTH_CLIENT_SECRET || !env.GOOGLE_OAUTH_REFRESH_TOKEN) {
+        return jsonResponse({ error: "Attachments aren't configured yet." }, 500);
+      }
+      try {
+        const accessToken = await getGoogleAccessToken(env);
+        await deleteFromDrive(fileId, accessToken);
+        return jsonResponse({ ok: true });
+      } catch (e) {
+        return jsonResponse({ error: e.message || "Delete failed." }, 500);
       }
     }
 

@@ -12,7 +12,7 @@
  *   EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, EMAILJS_PUBLIC_KEY, EMAILJS_PRIVATE_KEY
  *   (daily-report recipients are config/access.reportRecipients, managed from the Access page -- not a secret)
  *   ROOTSYS_API_KEY (optional — AI-generated advisor insights via rootsys.cloud's
- *   OpenAI-compatible endpoint, model fiq/hy3-tencent; falls back to
+ *   OpenAI-compatible endpoint, model hy3-tencent; falls back to
  *   rule-based buildInsights() if unset or the call fails)
  *   TIKTOK_ADVERTISER_ID (optional — TikTok Ads spend/sales/ROAS card; skipped
  *   entirely if unset. The access token itself is NOT an env var -- it's
@@ -378,6 +378,80 @@ function toMYT(dateInput) { return new Date(new Date(dateInput).getTime() + MY_O
 function myDateStr(dateInput) { return toMYT(dateInput).toISOString().slice(0, 10); }
 function myMonthKey(dateInput) { return toMYT(dateInput).toISOString().slice(0, 7); }
 function myYesterdayStr() { return myDateStr(new Date(Date.now() - 24 * 60 * 60 * 1000)); }
+
+// ---------- Assignment Sheet deadline reminders ----------
+// Runs on every invocation (see the bottom of this file), independent of
+// the sales-sync lock below -- these are time-sensitive (fire at a specific
+// moment) and an unrelated concern from the Shopify sync work, so they
+// shouldn't wait on or get skipped by that lock. Each notification is
+// one-shot per assignment, tracked via a flag written onto the assignment
+// doc itself (overdueNotifiedAt/dueSoonNotifiedAt) so re-running this every
+// ~2 minutes (the external cron cadence -- see sync.yml) never double-sends.
+//
+// dueDate is stored as a naive "YYYY-MM-DDTHH:MM" local string (no
+// timezone) -- see assignments.js's New/Edit modal -- meaning it's always
+// Malaysia wall-clock time by convention, never a real UTC instant on its
+// own. Appending "+08:00" is what turns it into one for comparison against
+// Date.now().
+function dueDateInstant(dueDate) { return new Date(`${dueDate.slice(0, 16)}:00+08:00`); }
+function fmtDueTime(dueDate) {
+  return dueDateInstant(dueDate).toLocaleString("en-MY", { hour: "numeric", minute: "2-digit", timeZone: "Asia/Kuala_Lumpur" });
+}
+async function notifyOne(toEmail, { type, title, body, link }) {
+  await db.collection("notifications").add({
+    toEmail: (toEmail || "").toLowerCase(), type, title, body: body || "", link: link || "",
+    createdAt: new Date().toISOString(), read: false,
+  });
+}
+async function checkAssignmentNotifications() {
+  const now = new Date();
+  const nowMy = toMYT(now);
+  const isPast8am = nowMy.getUTCHours() >= 8; // toMYT() shifts the instant so UTC getters read as MYT wall-clock, same trick as myDateStr()
+  const tomorrowStr = myDateStr(new Date(now.getTime() + 24 * 60 * 60 * 1000));
+
+  // Bounded to roughly "recent past + near future" via a plain range query
+  // on dueDate itself (its YYYY-MM-DD... shape sorts correctly as a plain
+  // string) -- both checks below only ever care about a due date within
+  // about a day of now, so there's no reason to keep re-reading the FULL
+  // assignments history (which only grows) on every single ~2-minute run.
+  // No composite index needed -- a single inequality filter is auto-indexed.
+  const cutoff = myDateStr(new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000));
+  const snap = await db.collection("assignments").where("dueDate", ">=", cutoff).get();
+
+  for (const docSnap of snap.docs) {
+    const a = docSnap.data();
+    if (!a.dueDate) continue;
+
+    // 1. Deadline has passed -- nudge the CREATOR to go review/rate it,
+    // once, regardless of current status (an unfinished overdue task still
+    // deserves the nudge, not just a finished-but-unreviewed one).
+    if (!a.overdueNotifiedAt && dueDateInstant(a.dueDate) <= now) {
+      await notifyOne(a.assignedBy, {
+        type: "assignment",
+        title: "Assignment due",
+        body: `"${a.title}" is due already — please review and rate it.`,
+        link: `assignments.html?id=${docSnap.id}`,
+      });
+      await docSnap.ref.update({ overdueNotifiedAt: now.toISOString() });
+    }
+
+    // 2. Due tomorrow -- nudge every ASSIGNEE, once, from 8am MYT the day
+    // before (not necessarily exactly at 8:00:00 -- whenever the next
+    // ~2-minute check lands at/after that point, or immediately if the
+    // assignment was only created later that same day). Skipped once
+    // already done -- nothing left to remind them about.
+    if (!a.dueSoonNotifiedAt && a.status !== "done" && a.dueDate.slice(0, 10) === tomorrowStr && isPast8am) {
+      const time = fmtDueTime(a.dueDate);
+      await Promise.all((a.assignedTo || []).map((email) => notifyOne(email, {
+        type: "assignment",
+        title: "Assignment due tomorrow",
+        body: `"${a.title}" is due tomorrow at ${time}.`,
+        link: `assignments.html?id=${docSnap.id}`,
+      })));
+      await docSnap.ref.update({ dueSoonNotifiedAt: now.toISOString() });
+    }
+  }
+}
 
 async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
   const TARGET = monthlyTarget || 0;
@@ -945,7 +1019,7 @@ async function generateAIInsights(context) {
   try {
     const rootsys = new OpenAI({ baseURL: "https://rootsys.cloud/v1", apiKey: process.env.ROOTSYS_API_KEY });
     const response = await rootsys.chat.completions.create({
-      model: "fiq/hy3-tencent",
+      model: "hy3-tencent",
       // hy3-tencent is a reasoning model -- left enabled, a single call here
       // burned 150-180K reasoning tokens and took ~60s for output that's
       // just a handful of short strings. Disabling it (verified live: same
@@ -1022,7 +1096,7 @@ async function generateStrategicAnalysis(context) {
   try {
     const rootsys = new OpenAI({ baseURL: "https://rootsys.cloud/v1", apiKey: process.env.ROOTSYS_API_KEY });
     const response = await rootsys.chat.completions.create({
-      model: "fiq/hy3-tencent",
+      model: "hy3-tencent",
       // See generateAIInsights()'s comment above -- reasoning left enabled
       // turns this into a ~60s call for no quality gain.
       reasoning: { enabled: false },
@@ -1623,6 +1697,16 @@ async function sendDailyEmailIfDue(freshMetrics, force) {
 
 // ---------- main ----------
 (async () => {
+  // Independent of the sales-sync lock below on purpose -- see
+  // checkAssignmentNotifications()'s own comment. A failure here shouldn't
+  // block the sales sync from running (or vice versa), so it's wrapped in
+  // its own try/catch rather than sharing the outer one.
+  try {
+    await checkAssignmentNotifications();
+  } catch (e) {
+    console.error("Assignment notification check failed:", e);
+  }
+
   const forceFull = process.env.FORCE_FULL === "true";
   const gotLock = await acquireLock(forceFull);
   if (!gotLock) {

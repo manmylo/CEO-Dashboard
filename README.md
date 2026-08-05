@@ -165,7 +165,7 @@ node --env-file=.env sync.js
 - **Phase 3:** customer segmentation (RFM/VIP), basket analysis, real LLM advisor. Done —
   VIP/at-risk segmentation, concentration risk, basket analysis ("frequently bought
   together" with lift), and an LLM-powered daily + strategic advisor (rootsys.cloud,
-  model fiq/hy3-tencent) are all live.
+  model hy3-tencent) are all live.
 
 ## Excluded SKUs
 
