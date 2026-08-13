@@ -403,8 +403,24 @@ async function notifyOne(toEmail, { type, title, body, link }) {
     createdAt: new Date().toISOString(), read: false,
   });
 }
+// Throttled to once every 15 min, not every single ~2-minute cron tick --
+// neither reminder needs to-the-minute precision (nobody needs to know
+// their task is overdue within 2 minutes of it happening), but the query
+// below reads every matching assignment on every call, and running it 720
+// times/day blew through the entire 50K/day Spark-plan Firestore read quota
+// in a single day on its own once this shipped. sync/state.lastNotifyCheck
+// tracks the last time this actually ran (not the sales-sync's own
+// lastFullSyncDate/lastEmailDate fields -- a separate concern, same doc).
+const NOTIFY_CHECK_INTERVAL_MS = 15 * 60 * 1000;
 async function checkAssignmentNotifications() {
   const now = new Date();
+  const stateSnap = await db.doc("sync/state").get();
+  const lastCheck = stateSnap.exists ? stateSnap.data().lastNotifyCheck : null;
+  if (lastCheck && now.getTime() - new Date(lastCheck).getTime() < NOTIFY_CHECK_INTERVAL_MS) {
+    return; // too soon -- skip the read entirely, not just the notifications
+  }
+  await db.doc("sync/state").set({ lastNotifyCheck: now.toISOString() }, { merge: true });
+
   const nowMy = toMYT(now);
   const isPast8am = nowMy.getUTCHours() >= 8; // toMYT() shifts the instant so UTC getters read as MYT wall-clock, same trick as myDateStr()
   const tomorrowStr = myDateStr(new Date(now.getTime() + 24 * 60 * 60 * 1000));
@@ -780,7 +796,12 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
         vendor: v.vendor, cost: money(v.cost), price: money(v.price),
         capital: money(v.inventory * v.cost) });
     } else if (v.inventory > 0 && sold90 > 0 && dsi > SLOWMOVING_DSI_DAYS) {
+      // vendor/cost/price included alongside dead stock's own candidates now
+      // (same free lookup off the already-fetched variant, no extra API
+      // call) so the dashboard's Slow Moving / Overstock exports can carry
+      // the exact same rich column set Dead Stock's own export does.
       slowMoving.push({ title: v.productTitle, sku: v.sku, onHand: v.inventory,
+        vendor: v.vendor, cost: money(v.cost), price: money(v.price),
         capital: money(v.inventory * v.cost), sold90, dsi: Math.round(dsi) });
     }
 
@@ -823,8 +844,13 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
       }
     }
   }
-  console.log(`Checking restock dates for ${deadStockCandidates.length} dead-stock candidate SKUs…`);
-  const restockDates = await getRestockDates(deadStockCandidates);
+  // One combined lookup for BOTH Dead Stock's own candidates and every
+  // Slow Moving item (Overstock needs no separate lookup at all -- see
+  // app.js's overstockRows(), a client-side filter over this exact
+  // slowMoving array) -- a SKU only ever needs its restock history fetched
+  // once, even though the two lists use the result differently below.
+  console.log(`Checking restock dates for ${deadStockCandidates.length + slowMoving.length} candidate SKUs…`);
+  const restockDates = await getRestockDates([...deadStockCandidates, ...slowMoving]);
   const nowMs = Date.now();
   const deadStock = [];
   for (const c of deadStockCandidates) {
@@ -837,6 +863,14 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
   }
   console.log(`Dead stock: ${deadStock.length} of ${deadStockCandidates.length} candidates `
     + `(${deadStockCandidates.length - deadStock.length} excluded — restocked too recently to judge).`);
+  // Slow Moving has no equivalent "too new to judge" exclusion -- unlike
+  // Dead Stock, a SKU only ever lands here because it already DID sell
+  // enough to clear its own dsi > SLOWMOVING_DSI_DAYS bar, so a recent
+  // restock doesn't disqualify it the way it would for Dead Stock. The
+  // date's just attached for display.
+  for (const s of slowMoving) {
+    s.restockDate = (restockDates.get(s.sku) || { date: null }).date;
+  }
 
   deadStock.sort((a, b) => b.capital - a.capital);
   slowMoving.sort((a, b) => b.capital - a.capital);
