@@ -196,6 +196,14 @@ export async function getRestockDates(candidates) {
     const noRowsAtAll = chunk.filter((sku) => !bySku.get(sku)?.size);
     if (noRowsAtAll.length) console.log(`   [INFO] Restock lookup — ${noRowsAtAll.length} SKU(s) had ZERO inventory_adjustment_history rows in the ${RESTOCK_LOOKBACK_DAYS}d window: ${noRowsAtAll.join(", ")}`);
 
+    // SKUs that HAD rows (unlike noRowsAtAll above) but still resolved to no
+    // date at all -- a genuinely different, previously-invisible failure
+    // mode from either "no rows" or "found a date." Distinguishing this
+    // from a silent null is what actually tells you whether a SKU that
+    // still shows up somewhere it shouldn't (e.g. still-restocked-but-
+    // showing-in-Overstock) is a real "no receiving event in this window"
+    // case or a data/matching gap worth chasing further.
+    const rowsButNoDate = [];
     for (const sku of chunk) {
       const perDay = bySku.get(sku);
       if (!perDay || !perDay.size) { results.set(sku, { date: null }); continue; }
@@ -236,7 +244,9 @@ export async function getRestockDates(candidates) {
         }
       }
       results.set(sku, { date: tier3Date });
+      if (!tier3Date) rowsButNoDate.push(sku);
     }
+    if (rowsButNoDate.length) console.log(`   [INFO] Restock lookup — ${rowsButNoDate.length} SKU(s) had history rows but NO receiving event matched any tier (resolved to null): ${rowsButNoDate.join(", ")}`);
   }
   return results;
 }
