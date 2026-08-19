@@ -1120,7 +1120,12 @@ Strict rules:
 - Don't force an observation for a metric that has no issue — prioritize the most important and actionable points first.
 - Keep each sentence short (1-2 sentences), including a suggested action where relevant.
 - Also mention something positive if there is one, not just problems.
-- All figures below (yesterday, mtdThroughYesterday, weekOverWeek) are through the end of asOfDate, a fully completed day — NOT a live, still-accumulating "today." Phrase observations that way (e.g. "jualan MTD sehingga [date]" or "jualan semalam"), never as "setakat ini hari ini" or "buat masa ini."`,
+- All figures below (yesterday, mtdThroughYesterday, weekOverWeek) are through the end of asOfDate, a fully completed day — NOT a live, still-accumulating "today." Phrase observations that way (e.g. "jualan MTD sehingga [date]" or "jualan semalam"), never as "setakat ini hari ini" or "buat masa ini."
+
+OUTPUT FORMAT — this overrides any instinct to write a readable report:
+Reply with a raw JSON object and NOTHING else. No preamble ("Here's a summary…"), no markdown headings, no code fences, no commentary after it. The very first character of your reply must be { and the very last must be }.
+Exact shape (each observation is one string in the array):
+{"insights": ["observation satu di sini", "observation dua di sini"]}`,
         },
         {
           role: "user",
@@ -1203,7 +1208,12 @@ Write 5-8 observations in plain business English, each 1-3 sentences. Cover, whe
 Strict rules:
 - Only use the numbers given. DO NOT invent figures, trends, or product/customer names that aren't in the data.
 - Be honest if the data shows risk — don't be overly positive if the numbers don't support it. Equally, don't manufacture urgency out of a single noisy data point.
-- Don't repeat the same sentence format as the daily tactical report ("Recommendations") — this should read like an executive is deciding, not a dashboard summarizing.`,
+- Don't repeat the same sentence format as the daily tactical report ("Recommendations") — this should read like an executive is deciding, not a dashboard summarizing.
+
+OUTPUT FORMAT — this overrides any instinct to write a readable report:
+Reply with a raw JSON object and NOTHING else. No preamble ("Here's a structured analysis…"), no markdown headings (no "# Gearevo Business Analysis"), no code fences, no commentary after it. The very first character of your reply must be { and the very last must be }.
+Exact shape (each observation is one string in the array; put the DECIDE NOW / WATCH OR ACT ON TREND tier inside the string itself):
+{"analysis": ["DECIDE NOW — first observation here", "WATCH OR ACT ON TREND — second observation here"]}`,
         },
         {
           role: "user",

@@ -1,0 +1,13 @@
+{
+  "name": "ceo-dashboard-functions",
+  "description": "Cloud Functions for the CEO Dashboard -- currently just sendPushOnNotification, which mirrors every new notifications/{id} doc out as a Windows/OS push via FCM.",
+  "main": "index.js",
+  "engines": {
+    "node": "20"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.7.0",
+    "firebase-functions": "^6.3.0"
+  },
+  "private": true
+}
