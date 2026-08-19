@@ -31,6 +31,10 @@
  *   GOOGLE_DRIVE_FOLDER_ID is that folder's ID (no sharing step needed --
  *   the account already owns it outright). See getGoogleAccessToken()/
  *   uploadToDrive() below.
+ *   GOOGLE_FORMS_FOLDER_ID (optional -- Form Database's PDF uploads, POST
+ *   /forms). Same OAuth account/credentials as GOOGLE_DRIVE_FOLDER_ID
+ *   above, just a separate dedicated folder so form PDFs and assignment
+ *   image attachments don't end up mixed together in the same place.
  */
 
 const FIREBASE_PROJECT_ID = "ceo-dashboard-9e9b4";
@@ -504,7 +508,22 @@ async function runTool(call, idToken, env) {
   throw new Error(`Unknown tool: ${call.name}`);
 }
 
-async function askAssistant(question, history, dashboardData, liveToday, idToken, apiKey, env, onChunk) {
+// Friendly one-liner shown in the chat bubble while a tool call is in
+// flight -- a round that calls a tool streams NO visible content at all
+// (see consumeStream()'s own comment), so without this the bubble just
+// sits on static "..." dots for however long that round-trip + the tool's
+// own fetch takes, easily several seconds for a question needing 1-2
+// lookups. Purely cosmetic (never part of the saved reply) -- see emit()
+// below and app.js's own NDJSON parsing of the "status" vs "content" line
+// types.
+const TOOL_STATUS = {
+  get_sales_by_date_range: "Checking sales figures…",
+  get_channel_region_by_date_range: "Breaking down sales by channel & region…",
+  get_returns_and_cancelled: "Checking returns & cancellations…",
+  get_calendar_events: "Checking the calendar…",
+  get_announcements: "Checking announcements…",
+};
+async function askAssistant(question, image, history, dashboardData, liveToday, idToken, apiKey, env, emit) {
   const todayMYT = new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
   // Anthropic's `system` param + cache_control-based prompt caching (frozen
@@ -533,19 +552,30 @@ ${JSON.stringify(dashboardData)}
 Live today (always current):
 ${JSON.stringify(liveToday)}`;
 
+  // OpenAI-compatible vision content-block shape -- rootsys.cloud describes
+  // itself as OpenAI-compatible and this is the near-universal convention
+  // every such provider follows, but hy3-tencent's own vision support was
+  // never independently confirmed against a real image. If it turns out
+  // unsupported, this fails loudly (a rootsys.cloud API error surfaced via
+  // the existing catch below), not silently.
+  const userContent = image
+    ? [{ type: "text", text: question || "What can you tell me about this image?" }, { type: "image_url", image_url: { url: image } }]
+    : question;
   const messages = [
     { role: "system", content: instructions },
     ...(history || []).map((m) => ({ role: m.role, content: m.content })),
-    { role: "user", content: question },
+    { role: "user", content: userContent },
   ];
+  emit("status", "Thinking…");
 
   // Agentic loop: the assistant may ask for a tool, we run it and feed the
   // result back, repeat until it gives a final text answer. Capped so a
   // stuck model can't loop forever. Every round streams -- a round only
   // reveals whether it's "a tool call" or "the final answer" once data
-  // starts arriving, so content deltas are forwarded to onChunk live as they
-  // come in; if the round turns out to be a tool call instead (content was
-  // empty throughout, confirmed by testing), there's nothing to undo.
+  // starts arriving, so content deltas are forwarded live via emit("content",
+  // ...) as they come in; if the round turns out to be a tool call instead
+  // (content was empty throughout, confirmed by testing), there's nothing to
+  // undo -- emit("status", ...) below is what fills that round's own silence.
   for (let round = 0; round < 4; round++) {
     const stream = await streamRootsys({
       model: "hy3-tencent",
@@ -559,7 +589,7 @@ ${JSON.stringify(liveToday)}`;
       messages,
     }, apiKey);
 
-    const { content, toolCalls, finishReason } = await consumeStream(stream, onChunk);
+    const { content, toolCalls, finishReason } = await consumeStream(stream, (chunk) => emit("content", chunk));
 
     if (toolCalls.length) {
       // OpenAI-style: echo the assistant's tool_calls back verbatim, then one
@@ -569,6 +599,8 @@ ${JSON.stringify(liveToday)}`;
         role: "assistant", content: content || null,
         tool_calls: toolCalls.map((tc) => ({ id: tc.id, type: "function", function: tc.function })),
       });
+      const statusLine = [...new Set(toolCalls.map((tc) => TOOL_STATUS[tc.function.name]).filter(Boolean))].join(" ");
+      if (statusLine) emit("status", statusLine);
       for (const tc of toolCalls) {
         let resultPayload;
         try {
@@ -898,6 +930,105 @@ async function deleteFromDrive(fileId, accessToken) {
   if (!res.ok && res.status !== 404) throw new Error(`Drive delete failed: ${await res.text().catch(() => "")}`);
 }
 
+// Non-streaming (stream: false, implicit by omission) -- a one-shot
+// extraction, nothing to display incrementally like the chat panel does.
+const PO_EXTRACT_SYSTEM_PROMPT = `You extract structured data from the raw text of a Purchase Order PDF (already text-extracted, so line breaks and column order may be jumbled -- read past that and use your judgement about what belongs together as one line item).
+
+Return ONLY a single JSON object, no markdown code fences, no commentary, no explanation. Shape exactly:
+{"poNumber": string, "items": [{"name": string, "sku": string, "quantity": number, "cost": number, "total": number}]}
+
+Rules:
+- poNumber is the purchase order's own reference (e.g. "PO68" from "#PO68"), "" if none found.
+- One entry in "items" per distinct product line in the order table, in the order they appear.
+- "name" is the full product name/description for that line (do not include the SKU code itself in the name).
+- "sku" is that line's short SKU/product code (e.g. "EDC07", "MT1A-PRO", "TIKI LE-B").
+- "quantity" is the ordered unit count for that line, as a number.
+- "cost" is that line's per-unit cost, as a plain number with no currency symbol.
+- "total" is that line's line-total cost, as a plain number with no currency symbol.
+- Ignore supplier/billing addresses, headers, footers, and cost-summary/subtotal/tax rows -- those are not line items.
+- If a field genuinely can't be determined for a line, use "" or 0, but never invent a line item that isn't really in the text.`;
+async function parsePurchaseOrderText(text, apiKey) {
+  const res = await fetch("https://rootsys.cloud/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({
+      model: "hy3-tencent",
+      reasoning: { enabled: false },
+      max_tokens: 4096,
+      messages: [
+        { role: "system", content: PO_EXTRACT_SYSTEM_PROMPT },
+        { role: "user", content: text.slice(0, 12000) },
+      ],
+    }),
+  });
+  if (!res.ok) throw new Error(`rootsys.cloud API error ${res.status}: ${await res.text().catch(() => "")}`);
+  const data = await res.json();
+  const raw = data.choices?.[0]?.message?.content || "";
+  // Strip a markdown fence if the model wrapped the JSON in one despite the
+  // system prompt asking it not to -- cheap defensive parsing rather than
+  // failing outright over a formatting slip.
+  const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "").trim();
+  let parsed;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch {
+    throw new Error("Couldn't understand the model's response.");
+  }
+  const items = Array.isArray(parsed.items) ? parsed.items.map((it) => ({
+    name: String(it.name || ""),
+    sku: String(it.sku || ""),
+    quantity: Number(it.quantity) || 0,
+    cost: Number(it.cost) || 0,
+    total: Number(it.total) || 0,
+  })) : [];
+  return { poNumber: String(parsed.poNumber || ""), items };
+}
+
+// Calendar's Stock Arrival card -- looks up each line item's product photo
+// by SKU so the item table can show a thumbnail instead of just text, once
+// a PO PDF's been imported (or an existing card with items is reopened).
+// Shopify's own `productVariants` query filter takes an OR'd list of
+// `sku:"..."` terms directly, so this is one GraphQL call for the whole
+// line-item list rather than one per SKU. Best-effort -- a SKU with no
+// match (typo, discontinued, service line like a delivery-cost row) just
+// comes back null, never an error for the whole batch.
+async function fetchProductImagesBySku(skus, env) {
+  const shop = env.SHOP_DOMAIN;
+  const token = env.SHOP_TOKEN;
+  if (!shop || !token) throw new Error("Shopify credentials not configured on this Worker.");
+  const ver = env.SHOP_API_VERSION || "2026-01";
+
+  const clean = [...new Set(skus.map((s) => String(s || "").trim()).filter(Boolean))].slice(0, 50);
+  const images = {};
+  if (!clean.length) return images;
+  // Escape a literal double-quote inside a SKU (rare, but a raw one would
+  // break out of Shopify's own query-string quoting) -- SKUs otherwise
+  // don't need URL/GraphQL escaping beyond this.
+  const q = clean.map((sku) => `sku:"${sku.replace(/"/g, '\\"')}"`).join(" OR ");
+  const res = await fetch(`https://${shop}/admin/api/${ver}/graphql.json`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": token },
+    body: JSON.stringify({
+      query: `query($q: String!) { productVariants(first: 50, query: $q) { nodes {
+        sku
+        image { url }
+        product { featuredImage { url } }
+      } } }`,
+      variables: { q },
+    }),
+  });
+  if (!res.ok) throw new Error(`Shopify API error ${res.status}: ${await res.text().catch(() => "")}`);
+  const body = await res.json();
+  if (body.errors) throw new Error(`Shopify GraphQL error: ${JSON.stringify(body.errors)}`);
+  for (const v of body.data?.productVariants?.nodes || []) {
+    if (!v.sku) continue;
+    // Variant's own image if it has one (e.g. a colour-specific shot),
+    // falling back to the product's featured image otherwise.
+    images[v.sku] = v.image?.url || v.product?.featuredImage?.url || null;
+  }
+  return images;
+}
+
 async function verifyAuth(idToken) {
   const firestoreResult = await fetchDashboardLatest(idToken);
   return firestoreResult.ok;
@@ -934,13 +1065,160 @@ export default {
       }
       const file = form.get("file");
       if (!file || typeof file === "string") return jsonResponse({ error: "Missing file" }, 400);
-      const ALLOWED_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
-      if (!ALLOWED_TYPES.has(file.type)) return jsonResponse({ error: "Only PNG/JPEG/WEBP/GIF images are allowed." }, 400);
-      if (file.size > 8 * 1024 * 1024) return jsonResponse({ error: "Image is too large (max 8MB)." }, 400);
+      // Images plus PDF/Word/Excel documents -- extension checked too, not
+      // just MIME type, same reasoning as /forms below (Word/Excel are
+      // sometimes reported as empty or application/octet-stream by the
+      // browser/OS, a known quirk); the client already applies this same
+      // fallback (see assignments.js), and this has to match it or a file
+      // that passed client-side validation would still 400 here.
+      const ALLOWED_TYPES = new Set([
+        "image/png", "image/jpeg", "image/webp", "image/gif", "application/pdf",
+        "application/msword", // legacy .doc
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document", // .docx
+        "application/vnd.ms-excel", // legacy .xls
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", // .xlsx
+      ]);
+      const ALLOWED_EXTENSIONS = /\.(png|jpe?g|webp|gif|pdf|docx?|xlsx?)$/i;
+      if (!ALLOWED_TYPES.has(file.type) && !ALLOWED_EXTENSIONS.test(file.name || "")) {
+        return jsonResponse({ error: "Only PDF, Word, Excel, PNG, JPEG, WEBP, or GIF files are allowed." }, 400);
+      }
+      if (file.size > 8 * 1024 * 1024) return jsonResponse({ error: "File is too large (max 8MB)." }, 400);
       try {
         const accessToken = await getGoogleAccessToken(env);
         const buffer = await file.arrayBuffer();
         const result = await uploadToDrive(buffer, file.name || "attachment", file.type, accessToken, env.GOOGLE_DRIVE_FOLDER_ID);
+        return jsonResponse(result);
+      } catch (e) {
+        return jsonResponse({ error: e.message || "Upload failed." }, 500);
+      }
+    }
+
+    // Streams a Drive file's own raw bytes back through this Worker (same
+    // service-account credentials as the uploads above), rather than the
+    // browser hitting Drive directly -- needed for Memo's forced
+    // acknowledgment popup (page-shell.js), which renders a PDF attachment
+    // itself via pdf.js so it can track real scroll progress through the
+    // document (an <iframe> onto Drive's own viewer is cross-origin, so its
+    // scroll position can never be read from our page at all). Not
+    // restricted to PDFs specifically -- whatever file type is asked for
+    // just streams through as-is. Same "signed in is enough, the real gate
+    // is firestore.rules on whichever doc actually holds this fileId" model
+    // as every other route here -- the Drive file itself is already
+    // link-viewable by anyone holding the id (see uploadToDrive's own
+    // permissions.create call), so this adds no new exposure.
+    if (pathname === "/attachments/fetch") {
+      if (!(await verifyAuth(idToken))) return jsonResponse({ error: "Not authorized." }, 403);
+      if (!env.GOOGLE_OAUTH_CLIENT_ID || !env.GOOGLE_OAUTH_CLIENT_SECRET || !env.GOOGLE_OAUTH_REFRESH_TOKEN) {
+        return jsonResponse({ error: "Attachments aren't configured yet." }, 500);
+      }
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return jsonResponse({ error: "Invalid JSON" }, 400);
+      }
+      const fileId = body.fileId;
+      if (!fileId || typeof fileId !== "string") return jsonResponse({ error: "Missing fileId" }, 400);
+      try {
+        const accessToken = await getGoogleAccessToken(env);
+        const driveRes = await fetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media`, {
+          headers: { Authorization: `Bearer ${accessToken}` },
+        });
+        if (!driveRes.ok) return jsonResponse({ error: `Drive fetch failed: ${driveRes.status}` }, driveRes.status);
+        return new Response(driveRes.body, {
+          headers: { "Content-Type": driveRes.headers.get("Content-Type") || "application/octet-stream", ...corsHeaders() },
+        });
+      } catch (e) {
+        return jsonResponse({ error: e.message || "Fetch failed." }, 500);
+      }
+    }
+
+    // Form Database's uploads (PDF forms, plus PNG/JPG for logos/other image
+    // assets kept in the same library) -- same shared Drive account/OAuth
+    // credentials and the exact same uploadToDrive()/getGoogleAccessToken()
+    // helpers as /attachments above, just its own allowlist and its own
+    // dedicated Drive folder (GOOGLE_FORMS_FOLDER_ID) so the two don't mix
+    // in the same place. Who's actually ALLOWED to hit
+    // this endpoint isn't checked any tighter than "signed in" here, same as
+    // /attachments -- the real gate is firestore.rules' /forms create rule
+    // (Access-page tier only), which is what a non-admin could never get
+    // past to make an uploaded file show up as a real form. The UI itself
+    // also just never shows this control to anyone else.
+    if (pathname === "/forms") {
+      if (!(await verifyAuth(idToken))) return jsonResponse({ error: "Not authorized." }, 403);
+      if (!env.GOOGLE_OAUTH_CLIENT_ID || !env.GOOGLE_OAUTH_CLIENT_SECRET || !env.GOOGLE_OAUTH_REFRESH_TOKEN || !env.GOOGLE_FORMS_FOLDER_ID) {
+        return jsonResponse({ error: "Form Database isn't configured yet." }, 500);
+      }
+      let form;
+      try {
+        form = await request.formData();
+      } catch {
+        return jsonResponse({ error: "Invalid form data" }, 400);
+      }
+      const file = form.get("file");
+      if (!file || typeof file === "string") return jsonResponse({ error: "Missing file" }, 400);
+      // PDF/Word for actual forms, PNG/JPG for logos/other image assets kept
+      // in the same library. Extension checked too, not just MIME type --
+      // some browser/OS combinations report a Word file's type as empty or
+      // application/octet-stream, a known quirk; the client already applies
+      // this same fallback (see forms.js), and this has to match it or a
+      // file that passed client-side validation would still 400 here.
+      const FORM_ALLOWED_TYPES = new Set([
+        "application/pdf", "image/png", "image/jpeg",
+        "application/msword", // legacy .doc
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document", // .docx
+        "application/vnd.ms-excel", // legacy .xls
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", // .xlsx
+      ]);
+      const FORM_ALLOWED_EXTENSIONS = /\.(pdf|docx?|xlsx?|png|jpe?g)$/i;
+      if (!FORM_ALLOWED_TYPES.has(file.type) && !FORM_ALLOWED_EXTENSIONS.test(file.name || "")) {
+        return jsonResponse({ error: "Only PDF, Word, Excel, PNG, or JPG files are allowed." }, 400);
+      }
+      if (file.size > 20 * 1024 * 1024) return jsonResponse({ error: "File is too large (max 20MB)." }, 400);
+      try {
+        const accessToken = await getGoogleAccessToken(env);
+        const buffer = await file.arrayBuffer();
+        const result = await uploadToDrive(buffer, file.name || "form", file.type, accessToken, env.GOOGLE_FORMS_FOLDER_ID);
+        return jsonResponse(result);
+      } catch (e) {
+        return jsonResponse({ error: e.message || "Upload failed." }, 500);
+      }
+    }
+
+    // Staff Status leave attachments (MC scans, supporting letters, etc.) --
+    // same shared Drive account/OAuth credentials and the exact same
+    // uploadToDrive()/getGoogleAccessToken() helpers as /attachments and
+    // /forms above, just its own dedicated Drive folder
+    // (GOOGLE_LEAVE_FOLDER_ID) and its own allowlist (PDF or a photo of the
+    // document, no Word -- unlike /forms this is never itself an editable
+    // document). Who's allowed to hit this endpoint is just "signed in"
+    // (verifyAuth), same as the other two -- the real gate is
+    // firestore.rules' leaveRecords create/update rules (self-for-their-own-
+    // pending, or HR for anyone), which is what actually decides whether an
+    // uploaded file's URL can ever get attached to a real record.
+    if (pathname === "/leave-attachments") {
+      if (!(await verifyAuth(idToken))) return jsonResponse({ error: "Not authorized." }, 403);
+      if (!env.GOOGLE_OAUTH_CLIENT_ID || !env.GOOGLE_OAUTH_CLIENT_SECRET || !env.GOOGLE_OAUTH_REFRESH_TOKEN || !env.GOOGLE_LEAVE_FOLDER_ID) {
+        return jsonResponse({ error: "Leave attachments aren't configured yet." }, 500);
+      }
+      let form;
+      try {
+        form = await request.formData();
+      } catch {
+        return jsonResponse({ error: "Invalid form data" }, 400);
+      }
+      const file = form.get("file");
+      if (!file || typeof file === "string") return jsonResponse({ error: "Missing file" }, 400);
+      const LEAVE_ALLOWED_TYPES = new Set(["application/pdf", "image/png", "image/jpeg"]);
+      const LEAVE_ALLOWED_EXTENSIONS = /\.(pdf|png|jpe?g)$/i;
+      if (!LEAVE_ALLOWED_TYPES.has(file.type) && !LEAVE_ALLOWED_EXTENSIONS.test(file.name || "")) {
+        return jsonResponse({ error: "Only PDF, PNG, or JPG files are allowed." }, 400);
+      }
+      if (file.size > 10 * 1024 * 1024) return jsonResponse({ error: "File is too large (max 10MB)." }, 400);
+      try {
+        const accessToken = await getGoogleAccessToken(env);
+        const buffer = await file.arrayBuffer();
+        const result = await uploadToDrive(buffer, file.name || "leave-attachment", file.type, accessToken, env.GOOGLE_LEAVE_FOLDER_ID);
         return jsonResponse(result);
       } catch (e) {
         return jsonResponse({ error: e.message || "Upload failed." }, 500);
@@ -994,8 +1272,55 @@ export default {
       }
     }
 
+    // Calendar's Purchase Order card -- extracts PO number + line items
+    // (name/sku/quantity/cost/total) from a PO PDF's raw client-extracted
+    // text (calendar.js runs pdf.js itself and posts the text here, not the
+    // PDF bytes). A hand-written regex/heuristic parser mis-split item
+    // names across rows on real store PDFs (confirmed twice against actual
+    // output before this replaced it) -- the same rootsys.cloud model the
+    // chatbot uses tolerates jumbled-but-present table text far better than
+    // any fixed pattern.
+    if (pathname === "/parse-po") {
+      const text = (body.text || "").trim();
+      if (!text) return jsonResponse({ error: "Missing text" }, 400);
+      if (!(await verifyAuth(idToken))) return jsonResponse({ error: "Not authorized." }, 403);
+      try {
+        const result = await parsePurchaseOrderText(text, env.ROOTSYS_API_KEY);
+        return jsonResponse(result);
+      } catch (e) {
+        return jsonResponse({ error: e.message || "Couldn't parse that PDF." }, 500);
+      }
+    }
+
+    if (pathname === "/product-images") {
+      const skus = Array.isArray(body.skus) ? body.skus : [];
+      if (!(await verifyAuth(idToken))) return jsonResponse({ error: "Not authorized." }, 403);
+      try {
+        const images = await fetchProductImagesBySku(skus, env);
+        return jsonResponse({ images });
+      } catch (e) {
+        return jsonResponse({ error: e.message || "Couldn't look up product images." }, 500);
+      }
+    }
+
     const question = (body.message || "").trim();
-    if (!question) return jsonResponse({ error: "Missing message" }, 400);
+    // A JPEG/PNG data URL from app.js's stageChatImage() (client-side
+    // FileReader/clipboard-paste, no Drive upload involved -- see its own
+    // comment). A message needs EITHER real text or an image, not both --
+    // an image-only turn falls back to a generic prompt below so
+    // askAssistant() always has something to actually ask the model.
+    const image = body.image;
+    if (image != null) {
+      if (typeof image !== "string" || !/^data:image\/(jpeg|png);base64,/.test(image)) {
+        return jsonResponse({ error: "Image must be a JPEG or PNG data URL." }, 400);
+      }
+      // Base64 runs ~4/3 of the raw byte size -- caps the actual image
+      // around the same 8MB app.js itself already enforces client-side.
+      if (image.length > 11 * 1024 * 1024) {
+        return jsonResponse({ error: "Image is too large (max 8MB)." }, 400);
+      }
+    }
+    if (!question && !image) return jsonResponse({ error: "Missing message" }, 400);
 
     const firestoreResult = await fetchDashboardLatest(idToken);
     if (!firestoreResult.ok) {
@@ -1007,31 +1332,36 @@ export default {
       );
     }
 
-    // Streamed as plain text, not wrapped in JSON -- the client reads the
-    // response body directly and appends each chunk to the chat bubble live.
-    // Errors that happen AFTER streaming has started (rootsys.cloud dies
-    // mid-answer) can't change the HTTP status at that point, so they're
-    // appended to the stream as a visible marker instead; anything that
-    // fails BEFORE streaming starts (auth, the Firestore snapshot fetch
-    // above) still returns a normal jsonResponse with a real status code.
+    // Streamed as newline-delimited JSON, not raw text -- each line is
+    // {"t":"content","v":...} (a real answer chunk, appended to the chat
+    // bubble and saved as part of the reply) or {"t":"status","v":...} (a
+    // transient "Checking sales figures…"-style note shown while a tool
+    // call's own round-trip is otherwise completely silent -- see
+    // askAssistant()'s TOOL_STATUS -- overwritten/cleared on the client,
+    // never saved). app.js parses this line-by-line. Errors that happen
+    // AFTER streaming has started (rootsys.cloud dies mid-answer) can't
+    // change the HTTP status at that point, so they're appended as a
+    // content line instead; anything that fails BEFORE streaming starts
+    // (auth, the Firestore snapshot fetch above) still returns a normal
+    // jsonResponse with a real status code.
     try {
       const liveToday = await fetchGearevoTodayLive();
       const { readable, writable } = new TransformStream();
       const writer = writable.getWriter();
       const encoder = new TextEncoder();
+      const emit = (t, v) => writer.write(encoder.encode(JSON.stringify({ t, v }) + "\n"));
       ctx.waitUntil((async () => {
         try {
           await askAssistant(
-            question, body.history, firestoreResult.data, liveToday, idToken, env.ROOTSYS_API_KEY, env,
-            (chunk) => writer.write(encoder.encode(chunk))
+            question, image, body.history, firestoreResult.data, liveToday, idToken, env.ROOTSYS_API_KEY, env, emit
           );
         } catch (e) {
-          await writer.write(encoder.encode(`\n\n[Error: ${e.message || "Chat failed."}]`));
+          await emit("content", `\n\n[Error: ${e.message || "Chat failed."}]`);
         } finally {
           await writer.close();
         }
       })());
-      return new Response(readable, { headers: { "Content-Type": "text/plain; charset=utf-8", ...corsHeaders() } });
+      return new Response(readable, { headers: { "Content-Type": "application/x-ndjson; charset=utf-8", ...corsHeaders() } });
     } catch (e) {
       return jsonResponse({ error: e.message || "Chat failed." }, 500);
     }

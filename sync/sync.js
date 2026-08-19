@@ -710,17 +710,23 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
   // monthlyOrderTrend (the Business Analysis chart's per-month history).
   const monthlyOrderTrend = Object.values(monthlyOrderStats).sort((a, b) => a.month.localeCompare(b.month));
 
+  // Uncapped -- app.js's own "Show more" expand already handles an
+  // arbitrarily long list fine (same reasoning as the Date Range table's own
+  // aggregateProductsInRange(), which dropped its matching 20-item cap for
+  // the same reason). totalProfit90/productConcentration below both
+  // recompute from the raw byProduct object directly rather than reading
+  // this array, so removing the cap here doesn't touch either of them.
   const rankProducts = (byProduct) => Object.values(byProduct)
-    .sort((a, b) => b.profit - a.profit).slice(0, 20)
+    .sort((a, b) => b.profit - a.profit)
     .map((p) => ({
       title: p.title, profit: money(p.profit), revenue: money(p.revenue), units: p.units,
       margin: p.revenue ? money((p.profit / p.revenue) * 100) : 0,
     }));
   const topProducts = rankProducts(profitByProduct);
   const topProductsMTD = rankProducts(profitByProductMTD);
-  // Full (untruncated) 90-day profit total — topProducts above is capped at
-  // 20, so concentration ratios (e.g. "top 5 = X% of profit") must divide by
-  // this, not by summing the already-capped array.
+  // Full 90-day profit total, independent of topProducts' own length either
+  // way -- concentration ratios (e.g. "top 5 = X% of profit") must divide by
+  // this, not by summing whatever topProducts happens to hold.
   const totalProfit90 = Object.values(profitByProduct).reduce((s, p) => s + p.profit, 0);
 
   // Concentration risk, computed identically for each of the three periods —
