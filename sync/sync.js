@@ -869,14 +869,28 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
   }
   console.log(`Dead stock: ${deadStock.length} of ${deadStockCandidates.length} candidates `
     + `(${deadStockCandidates.length - deadStock.length} excluded — restocked too recently to judge).`);
-  // Slow Moving has no equivalent "too new to judge" exclusion -- unlike
-  // Dead Stock, a SKU only ever lands here because it already DID sell
-  // enough to clear its own dsi > SLOWMOVING_DSI_DAYS bar, so a recent
-  // restock doesn't disqualify it the way it would for Dead Stock. The
-  // date's just attached for display.
+  // Same "too new to judge" grace period Dead Stock gets, on purpose --
+  // DSI (on-hand ÷ recent velocity) reads artificially high right after a
+  // restock, since on-hand just jumped but velocity hasn't had
+  // SLOWMOVING_DSI_DAYS to reflect any selling-through of the fresh stock
+  // yet. Without this, a SKU that was fine before restocking looked
+  // "overstocked" the moment new stock landed, purely from the timing of
+  // the DSI math, not genuine slow-moving behavior. Previously exempted on
+  // the reasoning that a SKU here already DID sell (unlike Dead Stock's
+  // 0-sold rule) so a recent restock "doesn't disqualify" it -- but that
+  // missed that the on-hand half of DSI is exactly what a restock changes.
+  const slowMovingFiltered = [];
+  let slowMovingExcluded = 0;
   for (const s of slowMoving) {
-    s.restockDate = (restockDates.get(s.sku) || { date: null }).date;
+    const info = restockDates.get(s.sku) || { date: null };
+    s.restockDate = info.date;
+    const daysSinceRestock = info.date ? Math.floor((nowMs - new Date(info.date).getTime()) / 864e5) : null;
+    if (info.date && daysSinceRestock < SLOWMOVING_DSI_DAYS) { slowMovingExcluded++; continue; }
+    slowMovingFiltered.push(s);
   }
+  slowMoving.splice(0, slowMoving.length, ...slowMovingFiltered);
+  console.log(`Slow moving: ${slowMoving.length} of ${slowMoving.length + slowMovingExcluded} candidates `
+    + `(${slowMovingExcluded} excluded — restocked too recently to judge).`);
 
   deadStock.sort((a, b) => b.capital - a.capital);
   slowMoving.sort((a, b) => b.capital - a.capital);
