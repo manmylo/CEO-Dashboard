@@ -1044,7 +1044,29 @@ function computeBusinessAnalysis({ dailyTrend, monthlyOrderTrend, deadStock, sto
   };
 }
 
-// ---------- AI-generated advisor commentary (Claude) ----------
+// Despite requesting response_format: json_schema (strict) below, rootsys.cloud's
+// hy3-tencent doesn't reliably honor it -- confirmed live: real responses have come
+// back as prose ("Here's a summary of...") wrapping the actual JSON instead of pure
+// JSON, which a plain JSON.parse(content) chokes on immediately (SyntaxError:
+// Unexpected token 'H'...). Rather than trust the constraint blindly, this tries a
+// direct parse first (the common/fast case when the model DOES behave), then falls
+// back to slicing out the substring between the first "{" and the last "}" in the
+// response and parsing THAT -- recovers the JSON even when the model wraps it in a
+// sentence either side. Still throws (letting the caller's existing rule-based
+// fallback take over) if neither parse succeeds, so a genuinely broken/empty
+// response doesn't silently produce garbage.
+function extractJson(content) {
+  try {
+    return JSON.parse(content);
+  } catch {
+    const start = content.indexOf("{");
+    const end = content.lastIndexOf("}");
+    if (start === -1 || end === -1 || end < start) throw new Error(`No JSON object found in response: ${content.slice(0, 80)}...`);
+    return JSON.parse(content.slice(start, end + 1));
+  }
+}
+
+// ---------- AI-generated advisor commentary (rootsys.cloud) ----------
 // Replaces the rule-based buildInsights() output above when available, using
 // the exact same array-of-strings shape so the dashboard's Advisor panel
 // and the email's Recommendations section need no changes either way. Falls back to
@@ -1111,7 +1133,7 @@ Strict rules:
       console.log(`AI insights skipped: no content in response (finish_reason: ${response.choices?.[0]?.finish_reason}), using rule-based fallback.`);
       return null;
     }
-    const parsed = JSON.parse(content);
+    const parsed = extractJson(content);
     if (!parsed || !Array.isArray(parsed.insights) || !parsed.insights.length) {
       console.log(`AI insights skipped: response had no usable "insights" array, using rule-based fallback.`);
       return null;
@@ -1194,7 +1216,7 @@ Strict rules:
       console.log(`Strategic analysis skipped: no content in response (finish_reason: ${response.choices?.[0]?.finish_reason}).`);
       return null;
     }
-    const parsed = JSON.parse(content);
+    const parsed = extractJson(content);
     if (!parsed || !Array.isArray(parsed.analysis) || !parsed.analysis.length) {
       console.log(`Strategic analysis skipped: response had no usable "analysis" array.`);
       return null;
