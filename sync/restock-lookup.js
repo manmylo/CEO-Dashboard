@@ -74,22 +74,31 @@ export async function paginate(query, pick, variables = {}) {
 // to "0 sold in DEADSTOCK_WINDOW_DAYS from today," same as before.
 export const RESTOCK_LOOKBACK_DAYS = 180;
 
-// Restock-date detection, two tiers:
-//   Tier 1 — reference_document_type is non-null (ANY documented/tracked
-//     source: PO shipment received, transfer, etc). Originally gated on
-//     reference_document_type === "Inventory::PurchaseOrder" specifically,
-//     but real store data showed a PO shipment being received shows up as
-//     "Shipment received" in the Admin UI, and Shopify's own docs list other
-//     tracked types too (e.g. "Inventory::Transfer") — there's no single
-//     confirmed enum value for "this was a real restock." The concept that
-//     actually matters is documented vs. undocumented, not which specific
-//     document type.
-//   Tier 2 — reference_document_type is null (a fully untracked manual
-//     quantity edit in the Admin), used only as a fallback for pre-PO-
-//     workflow stock (this store started using Purchase Orders in April
-//     2026): specifically a manual adjustment that takes the running
+// Restock-date detection, three tiers, in priority order -- NOT just
+// whichever documented event happens to be most recent. Confirmed against
+// real store data (see check-restock.js output) that inventory_change_reason
+// actually distinguishes "shipment_received" (a Transfer landing) from
+// "purchase_order_received" (a PO landing) from a bare "received" (some
+// other tracked receiving flow) as genuinely different reason strings, not
+// variants of the same one -- so they're no longer treated as
+// interchangeable "any received-ish event, most recent wins."
+//   Tier 1 — inventory_change_reason === "shipment_received" specifically.
+//     The store's current/primary restock workflow (per real usage) --
+//     always wins over the other two tiers if present at all, regardless of
+//     whether an older Tier 2/3 event is chronologically closer to today.
+//   Tier 2 — any OTHER documented/tracked receiving signal: reason ===
+//     "purchase_order_received", reason === "received", or
+//     reference_document_type is non-null with a positive change (the
+//     store's older PO-only workflow, or any other tracked type Shopify's
+//     docs mention, e.g. "Inventory::Transfer" with a genuinely positive
+//     delta). Only consulted when Tier 1 has no match at all.
+//   Tier 3 — reference_document_type is null (a fully untracked manual
+//     quantity edit in the Admin), used only as a last-resort fallback for
+//     pre-PO-workflow stock (this store started using Purchase Orders in
+//     April 2026): specifically a manual adjustment that takes the running
 //     on-hand balance from <=0 up to positive (a genuine "back in stock"
-//     event), not just any manual tweak/correction.
+//     event), not just any manual tweak/correction. Only consulted when
+//     NEITHER Tier 1 nor Tier 2 has any match.
 // Only queried for dead-stock CANDIDATES (already known to have 0 sales in
 // DEADSTOCK_WINDOW_DAYS from today), not the whole catalog — shopifyqlQuery
 // has no pagination, so an unscoped store-wide query risks silent
@@ -157,12 +166,21 @@ export async function getRestockDates(candidates) {
       if (r.reference_document_type) seenTypes.add(r.reference_document_type);
       if (r.inventory_change_reason) seenReasons.add(r.inventory_change_reason);
       const perDay = bySku.get(sku) || bySku.set(sku, new Map()).get(sku);
-      const day = perDay.get(r.day) || perDay.set(r.day, { total: 0, documentedPositive: false, manualPositive: false, receivedEvent: false }).get(r.day);
+      const day = perDay.get(r.day) || perDay.set(r.day, {
+        total: 0, shipmentReceived: false, otherDocumented: false, manualPositive: false,
+      }).get(r.day);
       const change = Number(r.inventory_adjustment_change || 0);
       day.total += change;
-      if (r.reference_document_type != null && change > 0) day.documentedPositive = true;
+      const reason = r.inventory_change_reason || "";
+      if (reason === "shipment_received") day.shipmentReceived = true;
+      // Tier 2's catch-all -- a named receiving reason OTHER than
+      // shipment_received, or any documented type with a genuinely positive
+      // delta (covers doc types with no specific reason match, e.g. a
+      // straightforward Transfer/PO receipt that isn't the pipeline-drain
+      // quirk shipment_received's own negative-change case is).
+      else if (reason === "purchase_order_received" || reason === "received") day.otherDocumented = true;
+      else if (r.reference_document_type != null && change > 0) day.otherDocumented = true;
       if (r.reference_document_type == null && change > 0) day.manualPositive = true;
-      if (r.inventory_change_reason && r.inventory_change_reason.includes("received")) day.receivedEvent = true;
     }
     if (seenTypes.size) console.log(`   [INFO] Restock lookup — reference_document_type values seen: ${[...seenTypes].join(", ")}`);
     if (seenReasons.size) console.log(`   [INFO] Restock lookup — inventory_change_reason values seen: ${[...seenReasons].join(", ")}`);
@@ -183,31 +201,41 @@ export async function getRestockDates(candidates) {
       if (!perDay || !perDay.size) { results.set(sku, { date: null }); continue; }
       const days = [...perDay.keys()].sort(); // "YYYY-MM-DD" strings sort chronologically
 
-      // Tier 1: most recent documented (tracked) positive day, OR a day with
-      // a "received" event by reason (see receivedEvent note above) —
-      // unambiguous on its own, no balance reconstruction needed.
+      // Tier 1: most recent shipment_received day -- wins outright if
+      // present, never overridden by an older Tier 1 day existing alongside
+      // a more-recent-looking Tier 2/3 signal (there isn't one to compare
+      // against here; this tier is checked to exhaustion FIRST, in full
+      // isolation from the other two).
       let tier1Date = null;
-      for (const d of days) if (perDay.get(d).documentedPositive || perDay.get(d).receivedEvent) tier1Date = d; // ascending order, last match wins
+      for (const d of days) if (perDay.get(d).shipmentReceived) tier1Date = d; // ascending order, last match wins
       if (tier1Date) { results.set(sku, { date: tier1Date }); continue; }
 
-      // Tier 2: most recent manual adjustment that crossed the running
-      // balance from <=0 to >0. Reconstructed by walking forward from a
-      // start-of-window balance derived from today's live on-hand quantity
-      // minus the window's total net change (no absolute balance is directly
-      // queryable — only daily deltas — so this is the only way to know what
-      // the balance was on any given day in the window).
-      const onHand = onHandBySku.get(sku);
+      // Tier 2: most recent OTHER documented/tracked receiving day (PO
+      // received, bare "received", or any other tracked type with a real
+      // positive delta) -- only reached when Tier 1 found nothing at all.
       let tier2Date = null;
+      for (const d of days) if (perDay.get(d).otherDocumented) tier2Date = d;
+      if (tier2Date) { results.set(sku, { date: tier2Date }); continue; }
+
+      // Tier 3: most recent manual adjustment that crossed the running
+      // balance from <=0 to >0 -- last resort, only reached when NEITHER
+      // Tier 1 nor Tier 2 found anything. Reconstructed by walking forward
+      // from a start-of-window balance derived from today's live on-hand
+      // quantity minus the window's total net change (no absolute balance
+      // is directly queryable — only daily deltas — so this is the only way
+      // to know what the balance was on any given day in the window).
+      const onHand = onHandBySku.get(sku);
+      let tier3Date = null;
       if (onHand != null) {
         const totalWindowDelta = days.reduce((s, d) => s + perDay.get(d).total, 0);
         let balance = onHand - totalWindowDelta;
         for (const d of days) {
           const before = balance;
           balance += perDay.get(d).total;
-          if (perDay.get(d).manualPositive && before <= 0 && balance > 0) tier2Date = d;
+          if (perDay.get(d).manualPositive && before <= 0 && balance > 0) tier3Date = d;
         }
       }
-      results.set(sku, { date: tier2Date });
+      results.set(sku, { date: tier3Date });
     }
   }
   return results;
