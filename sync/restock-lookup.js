@@ -107,7 +107,22 @@ export const RESTOCK_LOOKBACK_DAYS = 180;
 // data exists is RESTOCK_LOOKBACK_DAYS (180) — a SKU with no visible
 // restock event at all in that window returns { date: null }, meaning
 // "unknown, or genuinely more than 180 days ago" (displayed as ">180d").
-const RESTOCK_QUERY_CHUNK = 50; // SKUs per ShopifyQL call
+// 12, not 50. shopifyqlQuery has NO pagination and silently caps how many
+// rows it returns -- and this query is far bigger per SKU than it looks:
+// GROUP BY day, sku, reference_document_type, inventory_change_reason over
+// a 180-day window yields one row per (day × type × reason) COMBINATION, so
+// a single busy SKU can produce well over a hundred rows on its own. At 50
+// SKUs/call that blew past the cap, and the rows that got dropped were the
+// ones past the limit -- which, under the old ORDER BY day ASC, meant the
+// NEWEST days were the ones thrown away. That silently broke exactly the
+// case this whole lookup exists for: a SKU restocked days ago kept
+// resolving to a much older receiving event that happened to survive the
+// truncation (e.g. a PO received back in April instead of the transfer that
+// landed this month), so "restocked too recently to judge" never fired and
+// the SKU stayed in Dead Stock/Slow Moving/Overstock. Confirmed by the
+// isolated single-SKU diagnostic (check-restock.js) returning the correct
+// recent date for the very same SKUs the batch run got wrong.
+const RESTOCK_QUERY_CHUNK = 12; // SKUs per ShopifyQL call
 export async function getRestockDates(candidates) {
   const results = new Map(); // sku -> { date: "YYYY-MM-DD" | null }
   const onHandBySku = new Map(candidates.map((c) => [c.sku, c.onHand]));
@@ -116,10 +131,17 @@ export async function getRestockDates(candidates) {
   for (let i = 0; i < skus.length; i += RESTOCK_QUERY_CHUNK) {
     const chunk = skus.slice(i, i + RESTOCK_QUERY_CHUNK);
     const skuList = chunk.map((s) => `'${s.replace(/'/g, "\\'")}'`).join(", ");
+    // ORDER BY day DESC (was ASC) -- see RESTOCK_QUERY_CHUNK's comment. If
+    // the row cap is hit anyway despite the smaller chunks, this makes the
+    // truncation drop the OLDEST days instead of the newest, so the most
+    // recent receiving event -- the only one that actually matters for the
+    // "restocked too recently to judge" checks -- always survives. The JS
+    // below re-sorts each SKU's days itself ([...perDay.keys()].sort()), so
+    // nothing downstream depends on the query's own row order either way.
     const ql = `FROM inventory_adjustment_history SHOW inventory_adjustment_change `
       + `GROUP BY day, product_variant_sku, reference_document_type, inventory_change_reason `
       + `WHERE product_variant_sku IN (${skuList}) `
-      + `SINCE -${RESTOCK_LOOKBACK_DAYS}d UNTIL today ORDER BY day ASC`;
+      + `SINCE -${RESTOCK_LOOKBACK_DAYS}d UNTIL today ORDER BY day DESC`;
 
     let data;
     try {
@@ -157,6 +179,17 @@ export async function getRestockDates(candidates) {
     // received"), not one specific string -- a PO's own received-reason
     // string hasn't been confirmed and may differ (e.g. "purchase_order_
     // received"), but should also contain "received".
+    // Row count per chunk, logged so a silent shopifyqlQuery truncation can
+    // never go unnoticed again (see RESTOCK_QUERY_CHUNK's comment for what
+    // that cost last time). A count that's suspiciously round -- 500, 1000 --
+    // or identical across several chunks in a row is the tell: it means the
+    // cap was hit and some days were dropped, not that the data genuinely
+    // ended there. With ORDER BY day DESC above, even a capped result still
+    // keeps the newest days, so this is a warning to shrink the chunk
+    // further rather than an outright correctness failure.
+    const rowCount = (result?.tableData?.rows || []).length;
+    console.log(`   [INFO] Restock lookup — chunk of ${chunk.length} SKU(s) returned ${rowCount} row(s).`);
+
     const seenTypes = new Set();
     const seenReasons = new Set();
     const bySku = new Map();
