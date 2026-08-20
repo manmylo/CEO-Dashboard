@@ -1259,6 +1259,25 @@ Exact shape (each observation is one string in the array; put the DECIDE NOW / W
 // only marks the day as done when this is true, so an empty-recipients (or
 // unconfigured-EmailJS) run doesn't get silently marked "sent" for the day
 // and then skip the real send once recipients are actually ticked later.
+// Yesterday's own daily target -- a Calendar "Sales Target" card
+// (calendarCards, the same docs the Target Planner's Export to Calendar
+// writes). getCurrentMonthTarget() above is the MONTHLY figure from
+// yearlyCards and can't answer "did we hit it yesterday", which is what
+// decides whether the email's headline goes red.
+async function getDailyTargetFor(dateStr) {
+  try {
+    const snap = await db.collection("calendarCards")
+      .where("cardType", "==", "target").where("date", "==", dateStr).limit(1).get();
+    return snap.empty ? 0 : Number(snap.docs[0].data().targetAmount) || 0;
+  } catch (err) {
+    console.log(`Couldn't read the daily target for ${dateStr}: ${err.message}`);
+    return 0;
+  }
+}
+function emailEscape(s) {
+  return String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
 async function sendEmail(m, yesterday) {
   const { EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, EMAILJS_PUBLIC_KEY, EMAILJS_PRIVATE_KEY } = process.env;
   if (!EMAILJS_SERVICE_ID) { console.log("Email skipped (not configured)."); return false; }
@@ -1283,11 +1302,23 @@ async function sendEmail(m, yesterday) {
   // (not the old .filter(Boolean)) keeps the blank-line spacers — .filter(Boolean)
   // was silently stripping every "" spacer too, which is why the email had no
   // breathing room between sections at all.
+  // Did yesterday hit its own target? Drives the red headline below. No
+  // target card for that day = nothing to judge against, so it just reads
+  // as a plain figure rather than guessing a pass/fail.
+  const dailyTarget = await getDailyTargetFor(yesterday.date);
+  const missedTarget = dailyTarget > 0 && yesterday.todaySales < dailyTarget;
+  const shortfall = missedTarget ? dailyTarget - yesterday.todaySales : 0;
+  const targetSuffix = dailyTarget ? ` | Target ${rm(dailyTarget)}` : "";
+  const verdictLine = dailyTarget
+    ? (missedTarget ? `⚠️ BELOW TARGET by ${rm(shortfall)}` : `✅ Target achieved`)
+    : null;
+
   const lines = [
     `Good morning Boss.`,
     ``,
     `📊 SALES`,
-    `Yesterday (${yesterday.date}): ${rm(yesterday.todaySales)}${changeStr} — ${yesterday.orders} orders`,
+    `Yesterday (${yesterday.date}): ${rm(yesterday.todaySales)}${changeStr} — ${yesterday.orders} orders${targetSuffix}`,
+    verdictLine,
     `This month: ${rm(m.mtd.sales)}${m.mtd.target ? ` / ${rm(m.mtd.target)} (${m.mtd.targetPct}%)` : " (no target set for this month)"}`,
     ``,
     `💰 PROFIT`,
@@ -1317,12 +1348,33 @@ async function sendEmail(m, yesterday) {
   ];
   const body = lines.filter((line) => line !== null).join("\n");
 
+  // A SECOND, styled copy of the same report -- big headline figure, red
+  // when yesterday missed its target. Sent as its own template param rather
+  // than replacing `message`, because the EmailJS template renders
+  // {{message}} (double braces = HTML-escaped), so putting tags in there
+  // would print a literal <span style=...> in the email. Nothing breaks
+  // while the template still uses {{message}}: this param is simply
+  // ignored. Swap the template to {{{message_html}}} (TRIPLE braces, raw)
+  // to switch the report over to the styled version.
+  const headlineColour = missedTarget ? "#c0392b" : "#1a7f37";
+  const restOfBody = lines.filter((l) => l !== null).slice(3).join("\n"); // everything after the sales headline
+  const messageHtml = `<div style="font-family:Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1a1a1a">
+  <p style="margin:0 0 14px">Good morning Boss.</p>
+  <div style="border:1px solid #e3e6ea;border-left:5px solid ${headlineColour};border-radius:8px;padding:14px 16px;margin-bottom:16px">
+    <div style="font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#6b7280;font-weight:700">Yesterday's Sales · ${emailEscape(yesterday.date)}</div>
+    <div style="font-size:34px;line-height:1.15;font-weight:800;color:${headlineColour};margin:6px 0 2px">${emailEscape(rm(yesterday.todaySales))}</div>
+    <div style="font-size:13px;color:#4b5563">${emailEscape(changeStr.trim() || "")}${changeStr ? " · " : ""}${yesterday.orders} orders${dailyTarget ? ` · Target ${emailEscape(rm(dailyTarget))}` : ""}</div>
+    ${dailyTarget ? `<div style="margin-top:8px;font-size:14px;font-weight:700;color:${headlineColour}">${missedTarget ? `⚠️ Below target by ${emailEscape(rm(shortfall))}` : "✅ Target achieved"}</div>` : ""}
+  </div>
+  <pre style="font-family:Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:14px;line-height:1.55;white-space:pre-wrap;margin:0">${emailEscape(restOfBody)}</pre>
+</div>`;
+
   const res = await fetch("https://api.emailjs.com/api/v1.0/email/send", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       service_id: EMAILJS_SERVICE_ID, template_id: EMAILJS_TEMPLATE_ID,
       user_id: EMAILJS_PUBLIC_KEY, accessToken: EMAILJS_PRIVATE_KEY,
-      template_params: { to_email, bcc_emails: bccList.join(","), subject: `Gearevo Report ${yesterday.date}`, message: body, header: "DAILY REPORT",
+      template_params: { to_email, bcc_emails: bccList.join(","), subject: `Gearevo Report ${yesterday.date}`, message: body, message_html: messageHtml, header: "DAILY REPORT",
         link: "https://ceo-dashboard-9e9b4.web.app/index.html", link_label: "Open Dashboard" },
     }),
   });
