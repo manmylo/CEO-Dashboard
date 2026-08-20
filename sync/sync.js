@@ -504,6 +504,7 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
   // months keep their final numbers after they age out of the 90-day window.
   const monthlyOrderStats = {};
   const soldUnits7 = {}, soldUnits30 = {}, soldUnits90 = {}; // 7/30 feed the DSI velocity blend; 90 gates dead-stock candidacy/slow-moving
+  const unitsBySkuDate = {}; // sku -> "YYYY-MM-DD" -> units, for D90's auto-filled windows
   const profitByProduct = {};    // full 90-day window — dashboard's default "All" view
   const profitByProductMTD = {}; // this month only — used by the email report
   // Services (Sharpening/Engraving/Kydex/etc.) are excluded from all product
@@ -590,6 +591,15 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
         if (ageDays <= 7) soldUnits7[vid] = (soldUnits7[vid] || 0) + qty;
         if (ageDays <= 30) soldUnits30[vid] = (soldUnits30[vid] || 0) + qty;
         if (ageDays <= DEADSTOCK_WINDOW_DAYS) soldUnits90[vid] = (soldUnits90[vid] || 0) + qty;
+      }
+      // Per-SKU units per calendar day -- what auto-fills the D90 page's
+      // W1/W2/W4 windows (see updateD90Tracking). Deliberately keyed by SKU
+      // rather than product id: the existing daily/{date}.products array is
+      // product-level, so it can't answer "how many of THIS variant sold",
+      // which is exactly what a D90 entry tracks.
+      if (v?.sku) {
+        const bySku = unitsBySkuDate[v.sku] || (unitsBySkuDate[v.sku] = {});
+        bySku[createdDateStr] = (bySku[createdDateStr] || 0) + qty;
       }
 
       const pid = v?.productId || li.product?.id || li.product?.title || "unknown";
@@ -934,7 +944,7 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
     stockOut, // deadStock/stockOut unsliced — dashboard shows first 20 with a "see more" toggle for the rest
     basketAnalysis, // "frequently bought together" — top pairs by lift, 90-day window
     ...computeInventory(variantMap),
-    dailyTrend, monthlyOrderTrend, concentrationByPeriod, // all merged into businessAnalysis in runFull(), not written to dashboard/latest directly
+    dailyTrend, monthlyOrderTrend, concentrationByPeriod, unitsBySkuDate, // all merged into businessAnalysis in runFull(), not written to dashboard/latest directly
     insights: buildInsights({ mtdSales, margin, deadStock, stockAlerts, stockOut, target: TARGET }),
   };
 }
@@ -1264,6 +1274,62 @@ Exact shape (each observation is one string in the array; put the DECIDE NOW / W
     console.log(`Strategic analysis failed: ${e.message}`);
     return null;
   }
+}
+
+// ---------- D90 auto-fill ----------
+// Fills each D90 entry's W1/W2/W4 with UNITS SOLD of that SKU inside the
+// window, so the inventory team doesn't key them in by hand.
+//
+// Windows are contiguous and non-overlapping, each ending the day before
+// the next begins, so no sale is counted twice:
+//   W1: arrival day        -> arrival + 6   (the 7 days up to W1)
+//   W2: arrival + 7        -> arrival + 13  (the 7 days up to W2)
+//   W4: arrival + 14       -> arrival + 28  (W2 through to W4)
+// A window is only written once it has FULLY elapsed -- a half-finished
+// week would otherwise look like a genuinely weak one.
+const D90_WINDOWS = [
+  { key: "w1", from: 0, to: 6 },
+  { key: "w2", from: 7, to: 13 },
+  { key: "w4", from: 14, to: 28 },
+];
+function addDaysStr(dateStr, n) {
+  const d = new Date(`${dateStr}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+async function updateD90Tracking(unitsBySkuDate) {
+  if (!unitsBySkuDate) return;
+  const snap = await db.collection("d90Tracking").get();
+  if (snap.empty) { console.log("D90 auto-fill: no entries."); return; }
+  const today = myDateStr(new Date());
+  let touched = 0;
+
+  for (const docSnap of snap.docs) {
+    const data = docSnap.data();
+    const start = data.startDate;
+    if (!start || !Array.isArray(data.items)) continue;
+
+    let changed = false;
+    const items = data.items.map((it) => {
+      if (!it.sku) return it;
+      const byDate = unitsBySkuDate[it.sku] || {};
+      const sold = { ...(it.sold || {}) };
+      for (const w of D90_WINDOWS) {
+        const from = addDaysStr(start, w.from);
+        const to = addDaysStr(start, w.to);
+        if (today <= to) continue; // window still running -- leave it blank
+        let units = 0;
+        for (let d = from; d <= to; d = addDaysStr(d, 1)) units += byDate[d] || 0;
+        if (sold[w.key] !== units) { sold[w.key] = units; changed = true; }
+      }
+      return { ...it, sold };
+    });
+
+    if (!changed) continue;
+    await docSnap.ref.update({ items, autoFilledAt: new Date().toISOString() });
+    touched++;
+  }
+  console.log(`D90 auto-fill: updated ${touched} of ${snap.size} entr${snap.size === 1 ? "y" : "ies"}.`);
 }
 
 // ---------- email (EmailJS, server-side) ----------
@@ -1628,7 +1694,7 @@ async function syncTikTokAds(scope = "month") {
 async function runFull() {
   const raw = await pull();
   const metrics = await compute(raw);
-  const { dailyTrend, monthlyOrderTrend, concentrationByPeriod, ...latest } = metrics;
+  const { dailyTrend, monthlyOrderTrend, concentrationByPeriod, unitsBySkuDate, ...latest } = metrics;
 
   const customers = await pullCustomers();
   latest.customerSegments = computeCustomerSegments(customers);
@@ -1739,6 +1805,13 @@ async function runFull() {
   batch.set(db.doc("sync/state"), { lastFullSyncDate: metrics.date, lastFullSyncAt: metrics.generatedAt });
   await batch.commit();
   console.log(`Full sync — dashboard/latest + ${dailyTrend.length} daily docs + ${latest.businessAnalysis.monthlyTrend.length} monthly docs.`);
+  // Non-fatal on purpose -- D90 is a side feature, and a failure here must
+  // never take down the sales sync that just finished writing.
+  try {
+    await updateD90Tracking(unitsBySkuDate);
+  } catch (e) {
+    console.error(`D90 auto-fill failed (non-fatal): ${e.message}`);
+  }
 
   await syncShopeeAds();
   await syncTikTokAds();
