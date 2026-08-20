@@ -164,7 +164,7 @@ const Q_PRODUCTS = `
     products(first: 25, after: $cursor) {
       pageInfo { hasNextPage endCursor }
       nodes {
-        id title productType vendor
+        id title productType vendor status
         variants(first: 100) {
           nodes {
             id sku price inventoryQuantity
@@ -244,6 +244,12 @@ async function pullProducts() {
       variantMap.set(v.id, {
         productId: p.id,
         productTitle: p.title,
+        // ACTIVE | DRAFT | ARCHIVED. Kept on every variant rather than
+        // filtered out at the source on purpose -- computeInventory() MUST
+        // still see drafts to match Shopify's own ending_inventory_retail_value
+        // (see its comment: filtering by status there was tried and
+        // undercounted). Only the sellable-stock lists skip them.
+        status: p.status || "ACTIVE",
         category: p.productType || "Uncategorized",
         vendor: p.vendor || "",
         sku: v.sku || "",
@@ -774,6 +780,14 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
 
   const deadStockCandidates = [], slowMoving = [], stockAlerts = [], stockOut = [];
   for (const [vid, v] of variantMap) {
+    // Draft/archived products aren't on sale, so they can't be "dead"
+    // stock, slow moving, overstocked, or an out-of-stock revenue risk --
+    // every list built in this loop is about SELLABLE stock, and a draft
+    // was showing up as dead purely because it had never sold (it can't).
+    // Deliberately NOT filtered out of variantMap itself: computeInventory()
+    // still counts drafts, which is what keeps it matching Shopify's own
+    // ending_inventory_retail_value report (see its comment).
+    if (v.status && v.status !== "ACTIVE") continue;
     const sold90 = soldUnits90[vid] || 0;
     const sold30 = soldUnits30[vid] || 0;
     const sold7 = soldUnits7[vid] || 0;
