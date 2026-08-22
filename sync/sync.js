@@ -1438,7 +1438,14 @@ async function sendEmail(m, yesterday) {
   // to switch the report over to the styled version.
   const headlineColour = missedTarget ? "#c0392b" : "#1a7f37";
   const restOfBody = lines.filter((l) => l !== null).slice(3).join("\n"); // everything after the sales headline
-  const messageHtml = `<div style="font-family:Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1a1a1a">
+  // NOTE: the whitespace between these tags is stripped before sending (see
+  // the .replace below). The EmailJS template wraps this in a container that
+  // may still carry `white-space: pre-line` from when it rendered the
+  // plain-text {{message}} -- under that rule every newline between elements
+  // would become a visible blank line and blow the layout apart. Collapsing
+  // the gaps here means the email renders correctly either way, rather than
+  // depending on someone remembering to change that CSS.
+  const messageHtmlRaw = `<div style="font-family:Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1a1a1a">
   <p style="margin:0 0 14px">Good morning Boss.</p>
   <div style="border:1px solid #e3e6ea;border-left:5px solid ${headlineColour};border-radius:8px;padding:14px 16px;margin-bottom:16px">
     <div style="font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#6b7280;font-weight:700">Yesterday's Sales · ${emailEscape(yesterday.date)}</div>
@@ -1448,6 +1455,10 @@ async function sendEmail(m, yesterday) {
   </div>
   <pre style="font-family:Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:14px;line-height:1.55;white-space:pre-wrap;margin:0">${emailEscape(restOfBody)}</pre>
 </div>`;
+  // Safe against the report text: emailEscape() has already turned every
+  // < and > in it into entities, so this can only ever match the gaps
+  // BETWEEN real tags, never inside the message body itself.
+  const messageHtml = messageHtmlRaw.replace(/>\s+</g, "><");
 
   const res = await fetch("https://api.emailjs.com/api/v1.0/email/send", {
     method: "POST", headers: { "Content-Type": "application/json" },
