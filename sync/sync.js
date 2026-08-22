@@ -1354,6 +1354,15 @@ async function getDailyTargetFor(dateStr) {
     return 0;
   }
 }
+// "2026-08-21" -> "21 Aug 2026". Built from the parts rather than a Date
+// object, which would re-interpret the string in UTC and can show the day
+// before in a positive-offset timezone.
+const EMAIL_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+function fmtEmailDate(dateStr) {
+  const m = String(dateStr || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return String(dateStr || "");
+  return `${Number(m[3])} ${EMAIL_MONTHS[Number(m[2]) - 1]} ${m[1]}`;
+}
 function emailEscape(s) {
   return String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 }
@@ -1388,6 +1397,7 @@ async function sendEmail(m, yesterday) {
   const dailyTarget = await getDailyTargetFor(yesterday.date);
   const missedTarget = dailyTarget > 0 && yesterday.todaySales < dailyTarget;
   const shortfall = missedTarget ? dailyTarget - yesterday.todaySales : 0;
+  const surplus = dailyTarget > 0 && !missedTarget ? yesterday.todaySales - dailyTarget : 0;
   const targetSuffix = dailyTarget ? ` | Target ${rm(dailyTarget)}` : "";
   const verdictLine = dailyTarget
     ? (missedTarget ? `⚠️ BELOW TARGET by ${rm(shortfall)}` : `✅ Target achieved`)
@@ -1436,24 +1446,82 @@ async function sendEmail(m, yesterday) {
   // while the template still uses {{message}}: this param is simply
   // ignored. Swap the template to {{{message_html}}} (TRIPLE braces, raw)
   // to switch the report over to the styled version.
-  const headlineColour = missedTarget ? "#c0392b" : "#1a7f37";
-  const restOfBody = lines.filter((l) => l !== null).slice(3).join("\n"); // everything after the sales headline
-  // NOTE: the whitespace between these tags is stripped before sending (see
-  // the .replace below). The EmailJS template wraps this in a container that
-  // may still carry `white-space: pre-line` from when it rendered the
-  // plain-text {{message}} -- under that rule every newline between elements
-  // would become a visible blank line and blow the layout apart. Collapsing
-  // the gaps here means the email renders correctly either way, rather than
-  // depending on someone remembering to change that CSS.
-  const messageHtmlRaw = `<div style="font-family:Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1a1a1a">
-  <p style="margin:0 0 14px">Good morning Boss.</p>
-  <div style="border:1px solid #e3e6ea;border-left:5px solid ${headlineColour};border-radius:8px;padding:14px 16px;margin-bottom:16px">
-    <div style="font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#6b7280;font-weight:700">Yesterday's Sales · ${emailEscape(yesterday.date)}</div>
-    <div style="font-size:34px;line-height:1.15;font-weight:800;color:${headlineColour};margin:6px 0 2px">${emailEscape(rm(yesterday.todaySales))}</div>
-    <div style="font-size:13px;color:#4b5563">${emailEscape(changeStr.trim() || "")}${changeStr ? " · " : ""}${yesterday.orders} orders${dailyTarget ? ` · Target ${emailEscape(rm(dailyTarget))}` : ""}</div>
-    ${dailyTarget ? `<div style="margin-top:8px;font-size:14px;font-weight:700;color:${headlineColour}">${missedTarget ? `⚠️ Below target by ${emailEscape(rm(shortfall))}` : "✅ Target achieved"}</div>` : ""}
-  </div>
-  <pre style="font-family:Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:14px;line-height:1.55;white-space:pre-wrap;margin:0">${emailEscape(restOfBody)}</pre>
+  // ---- HTML body ----------------------------------------------------
+  // The same report, laid out properly instead of a wall of pre-formatted
+  // text. Table-based and fully inline-styled: Gmail/Outlook strip <style>
+  // blocks and have no flex/grid support, so this deliberately avoids both.
+  //
+  // Colour carries meaning and nothing else -- red only for a missed
+  // target or an out-of-stock line, amber only for a warning, green only
+  // for a target genuinely met. NEUTRAL when there's no target for the day:
+  // green there would read as "hit it" when the truth is "nothing to hit".
+  const OK = "#1a7f37", BAD = "#c0392b", WARN = "#b45309", INK = "#111827", MUTE = "#6b7280", LINE = "#e5e7eb";
+  const headlineColour = !dailyTarget ? INK : (missedTarget ? BAD : OK);
+  const section = (label, inner) => `<tr><td style="padding:18px 0 0">`
+    + `<div style="font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:${MUTE};padding-bottom:7px;border-bottom:1px solid ${LINE};margin-bottom:10px">${label}</div>`
+    + inner + `</td></tr>`;
+  // Label/value pair rendered as a table row -- the only layout primitive
+  // that behaves the same in every mail client.
+  const stat = (label, value, colour) => `<td style="padding:4px 0">`
+    + `<div style="font-size:11px;color:${MUTE}">${label}</div>`
+    + `<div style="font-size:15px;font-weight:700;color:${colour || INK}">${value}</div></td>`;
+  const note = (text, colour, bg) => `<div style="margin-top:8px;padding:9px 11px;border-radius:7px;`
+    + `background:${bg};border-left:3px solid ${colour};font-size:13px;line-height:1.5;color:${INK}">${text}</div>`;
+
+  const stockOutHtml = m.stockOut?.length ? (() => {
+    const withDemand = m.stockOut.filter((s) => s.sold30 > 0).length;
+    const worst = m.stockOut[0];
+    return note(`<b style="color:${BAD}">${m.stockOut.length} SKUs out of stock</b>`
+      + (withDemand ? ` — ${withDemand} sold in the last 30 days` : "")
+      + `<br><span style="color:${MUTE}">Worst: ${emailEscape(worst.title)} · ${worst.sold30} units/30d · order ~${worst.reorderQty}</span>`, BAD, "#fef2f2");
+  })() : "";
+  const lowStockHtml = m.stockAlerts?.length ? (() => {
+    const critical = m.stockAlerts.filter((a) => a.urgency === "critical").length;
+    const worst = m.stockAlerts[0];
+    const daysStr = worst.daysLeft === 0 ? "already out" : `${worst.daysLeft} days left`;
+    return note(`<b style="color:${WARN}">${m.stockAlerts.length} SKUs low</b>`
+      + (critical ? ` — ${critical} critical` : "")
+      + `<br><span style="color:${MUTE}">Most urgent: ${emailEscape(worst.title)} · ${daysStr} · order ~${worst.reorderQty}</span>`, WARN, "#fffbeb");
+  })() : "";
+
+  const messageHtmlRaw = `<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:${INK}">
+  <p style="margin:0 0 16px;font-size:14px">Good morning Boss.</p>
+  <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="border-collapse:collapse">
+    <tr><td style="border:1px solid ${LINE};border-left:4px solid ${headlineColour};border-radius:10px;padding:15px 17px;background:#fcfcfd">
+      <div style="font-size:10.5px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:${MUTE}">Yesterday's Sales · ${emailEscape(fmtEmailDate(yesterday.date))}</div>
+      <div style="font-size:34px;line-height:1.15;font-weight:800;color:${headlineColour};margin:7px 0 3px">${emailEscape(rm(yesterday.todaySales))}</div>
+      <div style="font-size:12.5px;color:${MUTE}">${emailEscape(changeStr.trim())}${changeStr ? " · " : ""}${yesterday.orders} orders${dailyTarget ? ` · Target ${emailEscape(rm(dailyTarget))}` : ""}</div>
+      ${dailyTarget
+        ? `<div style="margin-top:9px;font-size:13.5px;font-weight:700;color:${headlineColour}">${missedTarget ? `Below target by ${emailEscape(rm(shortfall))}` : `Target achieved${surplus > 0 ? ` — ${emailEscape(rm(surplus))} over` : ""}`}</div>`
+        : `<div style="margin-top:9px;font-size:12.5px;color:${MUTE}">No daily target set for this date.</div>`}
+    </td></tr>
+
+    ${section("This Month", `<table role="presentation" cellpadding="0" cellspacing="0" width="100%"><tr>
+      ${stat("Sales", emailEscape(rm(m.mtd.sales)))}
+      ${m.mtd.target ? stat("of Target", `${m.mtd.targetPct}%`, m.mtd.targetPct >= 100 ? OK : (m.mtd.targetPct < 50 ? BAD : WARN)) : stat("Target", "not set", MUTE)}
+      ${m.mtd.target ? stat("Target", emailEscape(rm(m.mtd.target))) : ""}
+    </tr></table>`)}
+
+    ${section("Profit", `<table role="presentation" cellpadding="0" cellspacing="0" width="100%"><tr>
+      ${stat("Margin", `${m.mtd.margin}%`)}
+      ${stat("Gross Profit", emailEscape(rm(m.mtd.grossProfit)))}
+      ${stat("AOV", emailEscape(rm(m.mtd.aov)))}
+      ${stat("Returns", `${m.returnsRate}%`)}
+    </tr></table>`)}
+
+    ${section("Top Product This Month", `<div style="font-size:13.5px;line-height:1.5">${emailEscape(topMTD?.title || "—")}`
+      + `<span style="color:${OK};font-weight:700"> · ${emailEscape(rm(topMTD?.profit || 0))} profit</span></div>`)}
+
+    ${(stockOutHtml || lowStockHtml) ? section("Stock", stockOutHtml + lowStockHtml) : ""}
+
+    ${m.insights?.length ? section("Recommendations",
+      `<table role="presentation" cellpadding="0" cellspacing="0" width="100%">`
+      + m.insights.map((i) => `<tr>
+          <td valign="top" style="width:14px;color:${MUTE};font-size:13px;line-height:1.6">•</td>
+          <td style="font-size:13px;line-height:1.6;padding-bottom:4px">${emailEscape(i)}</td>
+        </tr>`).join("")
+      + `</table>`) : ""}
+  </table>
 </div>`;
   // Safe against the report text: emailEscape() has already turned every
   // < and > in it into entities, so this can only ever match the gaps
