@@ -403,10 +403,18 @@ function dueDateInstant(dueDate) { return new Date(`${dueDate.slice(0, 16)}:00+0
 function fmtDueTime(dueDate) {
   return dueDateInstant(dueDate).toLocaleString("en-MY", { hour: "numeric", minute: "2-digit", timeZone: "Asia/Kuala_Lumpur" });
 }
+// Kept in step with page-shell.js's NOTIF_TTL_DAYS -- notifications written
+// from here and from the browser must expire on the same schedule, or the
+// pile would only half-clear.
+const NOTIF_TTL_DAYS = 10;
 async function notifyOne(toEmail, { type, title, body, link }) {
   await db.collection("notifications").add({
     toEmail: (toEmail || "").toLowerCase(), type, title, body: body || "", link: link || "",
     createdAt: new Date().toISOString(), read: false,
+    // Real Date -> Firestore Timestamp, which is what the TTL policy on this
+    // collection needs (a string field can't be used for TTL). Matches
+    // page-shell.js's notifExpiry() -- both must stay on the same window.
+    expireAt: new Date(Date.now() + NOTIF_TTL_DAYS * 864e5),
   });
 }
 // Throttled to once every 15 min, not every single ~2-minute cron tick --
