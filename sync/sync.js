@@ -28,7 +28,7 @@
 import admin from "firebase-admin";
 import OpenAI from "openai";
 import crypto from "crypto";
-import { isExcluded, isExcludedTitle, getServiceCategory } from "./excluded-skus.js";
+import { isExcluded, isExcludedTitle, getServiceCategory, isNonStockSku } from "./excluded-skus.js";
 import { graphql, paginate, getRestockDates } from "./restock-lookup.js";
 import { publishCalendarSlide } from "./calendar-slide.js";
 import * as backfillProducts from "./backfill-products.js";
@@ -808,6 +808,23 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
     // still counts drafts, which is what keeps it matching Shopify's own
     // ending_inventory_retail_value report (see its comment).
     if (v.status && v.status !== "ACTIVE") continue;
+    // Merch and POS-only patches (T-shirts, event patches). They sell, and
+    // that money is counted everywhere else -- revenue, profit, Top Products
+    // all still include them. They just don't belong in the four lists built
+    // in THIS loop, which exist to drive reordering decisions nobody makes
+    // about a leftover anniversary patch. Filtered here rather than out of
+    // variantMap, precisely so the sales side is untouched.
+    if (isNonStockSku(v.sku)) continue;
+    // Inventory tracking switched OFF in Shopify. A product can be perfectly
+    // ACTIVE and still not be counted -- made to order, drop-shipped, or just
+    // never set up -- and Shopify reports inventoryQuantity 0 for those.
+    // Every list in this loop reads that number, so an untracked variant
+    // reads as out of stock and, having "no stock that ever moves", as dead
+    // stock too. Neither is true: there is simply no figure to judge.
+    //
+    // Same reasoning as computeInventory()'s own `v.tracked` check, which has
+    // always skipped these when totalling inventory value.
+    if (!v.tracked) continue;
     const sold90 = soldUnits90[vid] || 0;
     const sold30 = soldUnits30[vid] || 0;
     const sold7 = soldUnits7[vid] || 0;

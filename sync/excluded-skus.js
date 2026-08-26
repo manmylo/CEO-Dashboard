@@ -104,3 +104,37 @@ export function isExcludedTitle(title) {
   const t = title.toUpperCase();
   return SERVICE_TITLE_PREFIXES.some((p) => t.startsWith(p.toUpperCase()));
 }
+
+/**
+ * Merch and POS-only items — real products that are sold, but NOT stock the
+ * business reorders or wants chased.
+ *
+ * Deliberately kept apart from SERVICE_SKU_CATEGORY above. That list means
+ * "this is a service": anything in it is dropped from variantMap entirely and
+ * its revenue is filed under the Services card. A T-shirt is neither — it's a
+ * genuine product sale that belongs in revenue, profit and Top Products. It
+ * just has no business appearing in dead stock, slow moving, overstock or
+ * out-of-stock, which exist to drive purchasing decisions nobody makes about
+ * a leftover event patch.
+ *
+ * So these are filtered ONLY where those four lists are built (see the
+ * variantMap loop in sync.js's compute()), and nowhere else.
+ */
+export const NON_STOCK_SKUS = new Set([
+  // T-shirts, every size
+  "GE-THS",
+  "GE-THM",
+  "GE-THL",
+  "GE-THXL",
+  "GE-TH2XL",
+  "GE-TH3XL",
+  "GE-THGS",        // Giesser logo
+  "THS",            // F. Herder logo
+  // Event / anniversary patches, point-of-sale only
+  "GE-P10",         // Gearevo 10th Anniversary Velcro Patch
+  "GE-EDCP2025",    // EDCMY x Gearevo RE Patch 2025
+]);
+
+export function isNonStockSku(sku) {
+  return !!sku && NON_STOCK_SKUS.has(sku);
+}
