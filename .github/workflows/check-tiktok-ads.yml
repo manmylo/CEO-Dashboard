@@ -16,6 +16,8 @@ on:
 jobs:
   check-tiktok-ads:
     runs-on: ubuntu-latest
+    # A hung run holds the concurrency group exactly like a queued one does.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 

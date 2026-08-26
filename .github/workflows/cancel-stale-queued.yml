@@ -1,0 +1,77 @@
+name: Cancel stale queued runs
+
+# GitHub has no built-in way to time out a run that is stuck QUEUED --
+# timeout-minutes only starts counting once a job is actually running on a
+# runner. So a run waiting on an unavailable runner sits there indefinitely.
+#
+# That matters here because the BI sync uses a concurrency group
+# (cancel-in-progress: false). ONE stuck queued run holds that group, and
+# every later trigger -- the external ~2-minute cron included -- just piles up
+# behind it. The sync silently stops until somebody notices and cancels by
+# hand.
+#
+# This sweeps them out. Anything queued longer than STALE_MINUTES is cancelled,
+# which releases the group and lets the next trigger through normally.
+
+on:
+  schedule:
+    # Every 15 minutes. The sweeper itself needs a runner, so it can't
+    # guarantee it runs the instant a job goes stale -- it clears the backlog
+    # as soon as capacity returns, which is the point.
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+# Never let the sweeper queue up behind copies of itself.
+concurrency:
+  group: cancel-stale-queued
+  cancel-in-progress: true
+
+permissions:
+  actions: write        # required to cancel a run
+  contents: read
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          STALE_MINUTES: "10"
+        with:
+          script: |
+            const staleMs = Number(process.env.STALE_MINUTES) * 60 * 1000;
+            const cutoff = Date.now() - staleMs;
+
+            const runs = await github.paginate(
+              github.rest.actions.listWorkflowRunsForRepo,
+              { owner: context.repo.owner, repo: context.repo.repo, status: "queued", per_page: 100 }
+            );
+
+            let cancelled = 0, skipped = 0;
+            for (const run of runs) {
+              // Never cancel this sweep -- it is itself "queued" while it
+              // starts, and cancelling itself would leave the real backlog
+              // untouched.
+              if (run.id === context.runId) continue;
+
+              const waitedMs = Date.now() - new Date(run.created_at).getTime();
+              const waitedMin = Math.round(waitedMs / 60000);
+              if (waitedMs < staleMs) {
+                skipped++;
+                core.info(`keep    #${run.run_number} ${run.name} — queued ${waitedMin}m`);
+                continue;
+              }
+              try {
+                await github.rest.actions.cancelWorkflowRun({
+                  owner: context.repo.owner, repo: context.repo.repo, run_id: run.id,
+                });
+                cancelled++;
+                core.notice(`Cancelled #${run.run_number} "${run.name}" — queued ${waitedMin}m with no runner.`);
+              } catch (err) {
+                // A run that started or finished between the list and the
+                // cancel returns 409. That's a race, not a failure.
+                core.warning(`Could not cancel #${run.run_number}: ${err.message}`);
+              }
+            }
+            core.info(`Queued runs: ${runs.length}. Cancelled ${cancelled}, left ${skipped}.`);
