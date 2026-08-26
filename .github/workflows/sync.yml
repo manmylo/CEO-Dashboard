@@ -15,6 +15,18 @@ on:
         description: "Backfill daily sales history from the Gearevo sales dashboard's Firestore (one-off, skips Shopify + email)"
         type: boolean
         default: false
+      # Recovers per-day PRODUCT/profit data for dates older than the sync's
+      # rolling 90-day window -- the days that show a real sales figure but
+      # "Nothing sold on this date". Needs the Shopify app to hold
+      # read_all_orders. Leave blank on every normal run.
+      products_from:
+        description: "Product backfill START date (YYYY-MM-DD). Leave blank unless recovering old product data."
+        type: string
+        default: ""
+      products_to:
+        description: "Product backfill END date (YYYY-MM-DD). Defaults to today."
+        type: string
+        default: ""
 
 # Triggered every ~2 min by an external cron (cron-job.org) — without this,
 # a run that gets cancelled or killed mid-flight (GitHub concurrent-job
@@ -60,6 +72,8 @@ jobs:
           FORCE_FULL: ${{ github.event.inputs.full }}
           FORCE_EMAIL: ${{ github.event.inputs.test_email }}
           FORCE_BACKFILL: ${{ github.event.inputs.backfill }}
+          BACKFILL_PRODUCTS_FROM: ${{ github.event.inputs.products_from }}
+          BACKFILL_PRODUCTS_TO: ${{ github.event.inputs.products_to }}
           ROOTSYS_API_KEY: ${{ secrets.ROOTSYS_API_KEY }}
           SHOPEE_PARTNER_ID: ${{ secrets.SHOPEE_PARTNER_ID }}
           SHOPEE_PARTNER_KEY: ${{ secrets.SHOPEE_PARTNER_KEY }}

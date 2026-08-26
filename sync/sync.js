@@ -31,6 +31,7 @@ import crypto from "crypto";
 import { isExcluded, isExcludedTitle, getServiceCategory } from "./excluded-skus.js";
 import { graphql, paginate, getRestockDates } from "./restock-lookup.js";
 import { publishCalendarSlide } from "./calendar-slide.js";
+import * as backfillProducts from "./backfill-products.js";
 
 // ---------- config ----------
 // SHOP_DOMAIN/SHOP_TOKEN/SHOP_API_VERSION are read directly by
@@ -2028,6 +2029,19 @@ async function sendDailyEmailIfDue(freshMetrics, force) {
   }
 
   try {
+    // One-off recovery of per-day product/profit data for dates older than
+    // ORDER_PULL_DAYS. Manual only (workflow_dispatch), never the cron -- it
+    // walks months of Shopify orders. See backfill-products.js.
+    if (process.env.BACKFILL_PRODUCTS_FROM) {
+      console.log("Mode: PRODUCT BACKFILL — skipping the normal sync and the email.");
+      await backfillProducts.run({
+        db, paginate, Q_ORDERS, pullProducts,
+        myDateStr, num, money, isExcluded, getServiceCategory,
+      });
+      console.log("Done ✅");
+      return;
+    }
+
     if (process.env.FORCE_BACKFILL === "true") {
       console.log("Mode: BACKFILL (from sales dashboard) — skipping Shopify + email.");
       await runBackfillFromDashboard();
