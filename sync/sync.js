@@ -30,6 +30,7 @@ import OpenAI from "openai";
 import crypto from "crypto";
 import { isExcluded, isExcludedTitle, getServiceCategory } from "./excluded-skus.js";
 import { graphql, paginate, getRestockDates } from "./restock-lookup.js";
+import { publishCalendarSlide } from "./calendar-slide.js";
 
 // ---------- config ----------
 // SHOP_DOMAIN/SHOP_TOKEN/SHOP_API_VERSION are read directly by
