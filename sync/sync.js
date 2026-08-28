@@ -32,6 +32,7 @@ import { isExcluded, isExcludedTitle, getServiceCategory, isNonStockSku } from "
 import { graphql, paginate, getRestockDates } from "./restock-lookup.js";
 import { publishCalendarSlide } from "./calendar-slide.js";
 import * as backfillProducts from "./backfill-products.js";
+import { checkAssignmentNotifications } from "./assignment-notify.js";
 
 // ---------- config ----------
 // SHOP_DOMAIN/SHOP_TOKEN/SHOP_API_VERSION are read directly by
@@ -388,102 +389,13 @@ function myMonthKey(dateInput) { return toMYT(dateInput).toISOString().slice(0, 
 function myYesterdayStr() { return myDateStr(new Date(Date.now() - 24 * 60 * 60 * 1000)); }
 
 // ---------- Assignment Sheet deadline reminders ----------
-// Runs on every invocation (see the bottom of this file), independent of
-// the sales-sync lock below -- these are time-sensitive (fire at a specific
-// moment) and an unrelated concern from the Shopify sync work, so they
-// shouldn't wait on or get skipped by that lock. Each notification is
-// one-shot per assignment, tracked via a flag written onto the assignment
-// doc itself (overdueNotifiedAt/dueSoonNotifiedAt) so re-running this every
-// ~2 minutes (the external cron cadence -- see sync.yml) never double-sends.
-//
-// dueDate is stored as a naive "YYYY-MM-DDTHH:MM" local string (no
-// timezone) -- see assignments.js's New/Edit modal -- meaning it's always
-// Malaysia wall-clock time by convention, never a real UTC instant on its
-// own. Appending "+08:00" is what turns it into one for comparison against
-// Date.now().
-function dueDateInstant(dueDate) { return new Date(`${dueDate.slice(0, 16)}:00+08:00`); }
-function fmtDueTime(dueDate) {
-  return dueDateInstant(dueDate).toLocaleString("en-MY", { hour: "numeric", minute: "2-digit", timeZone: "Asia/Kuala_Lumpur" });
-}
-// Kept in step with page-shell.js's NOTIF_TTL_DAYS -- notifications written
-// from here and from the browser must expire on the same schedule, or the
-// pile would only half-clear.
-const NOTIF_TTL_DAYS = 10;
-async function notifyOne(toEmail, { type, title, body, link }) {
-  await db.collection("notifications").add({
-    toEmail: (toEmail || "").toLowerCase(), type, title, body: body || "", link: link || "",
-    createdAt: new Date().toISOString(), read: false,
-    // Real Date -> Firestore Timestamp, which is what the TTL policy on this
-    // collection needs (a string field can't be used for TTL). Matches
-    // page-shell.js's notifExpiry() -- both must stay on the same window.
-    expireAt: new Date(Date.now() + NOTIF_TTL_DAYS * 864e5),
-  });
-}
-// Throttled to once every 15 min, not every single ~2-minute cron tick --
-// neither reminder needs to-the-minute precision (nobody needs to know
-// their task is overdue within 2 minutes of it happening), but the query
-// below reads every matching assignment on every call, and running it 720
-// times/day blew through the entire 50K/day Spark-plan Firestore read quota
-// in a single day on its own once this shipped. sync/state.lastNotifyCheck
-// tracks the last time this actually ran (not the sales-sync's own
-// lastFullSyncDate/lastEmailDate fields -- a separate concern, same doc).
-const NOTIFY_CHECK_INTERVAL_MS = 15 * 60 * 1000;
-async function checkAssignmentNotifications() {
-  const now = new Date();
-  const stateSnap = await db.doc("sync/state").get();
-  const lastCheck = stateSnap.exists ? stateSnap.data().lastNotifyCheck : null;
-  if (lastCheck && now.getTime() - new Date(lastCheck).getTime() < NOTIFY_CHECK_INTERVAL_MS) {
-    return; // too soon -- skip the read entirely, not just the notifications
-  }
-  await db.doc("sync/state").set({ lastNotifyCheck: now.toISOString() }, { merge: true });
-
-  const nowMy = toMYT(now);
-  const isPast8am = nowMy.getUTCHours() >= 8; // toMYT() shifts the instant so UTC getters read as MYT wall-clock, same trick as myDateStr()
-  const tomorrowStr = myDateStr(new Date(now.getTime() + 24 * 60 * 60 * 1000));
-
-  // Bounded to roughly "recent past + near future" via a plain range query
-  // on dueDate itself (its YYYY-MM-DD... shape sorts correctly as a plain
-  // string) -- both checks below only ever care about a due date within
-  // about a day of now, so there's no reason to keep re-reading the FULL
-  // assignments history (which only grows) on every single ~2-minute run.
-  // No composite index needed -- a single inequality filter is auto-indexed.
-  const cutoff = myDateStr(new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000));
-  const snap = await db.collection("assignments").where("dueDate", ">=", cutoff).get();
-
-  for (const docSnap of snap.docs) {
-    const a = docSnap.data();
-    if (!a.dueDate) continue;
-
-    // 1. Deadline has passed -- nudge the CREATOR to go review/rate it,
-    // once, regardless of current status (an unfinished overdue task still
-    // deserves the nudge, not just a finished-but-unreviewed one).
-    if (!a.overdueNotifiedAt && dueDateInstant(a.dueDate) <= now) {
-      await notifyOne(a.assignedBy, {
-        type: "assignment",
-        title: "Assignment due",
-        body: `"${a.title}" is due already — please review and rate it.`,
-        link: `assignments.html?id=${docSnap.id}`,
-      });
-      await docSnap.ref.update({ overdueNotifiedAt: now.toISOString() });
-    }
-
-    // 2. Due tomorrow -- nudge every ASSIGNEE, once, from 8am MYT the day
-    // before (not necessarily exactly at 8:00:00 -- whenever the next
-    // ~2-minute check lands at/after that point, or immediately if the
-    // assignment was only created later that same day). Skipped once
-    // already done -- nothing left to remind them about.
-    if (!a.dueSoonNotifiedAt && a.status !== "done" && a.dueDate.slice(0, 10) === tomorrowStr && isPast8am) {
-      const time = fmtDueTime(a.dueDate);
-      await Promise.all((a.assignedTo || []).map((email) => notifyOne(email, {
-        type: "assignment",
-        title: "Assignment due tomorrow",
-        body: `"${a.title}" is due tomorrow at ${time}.`,
-        link: `assignments.html?id=${docSnap.id}`,
-      })));
-      await docSnap.ref.update({ dueSoonNotifiedAt: now.toISOString() });
-    }
-  }
-}
+// Lives in ./assignment-notify.js. Runs on every invocation (see the bottom
+// of this file), independent of the sales-sync lock below -- these fire at a
+// specific moment and are an unrelated concern from the Shopify work, so they
+// must not wait on, or be skipped by, that lock. db and the two Malaysian-time
+// helpers are passed in rather than imported, so the module stays free of this
+// file's Firebase and environment setup and can be tested against a fake.
+const notifyDeps = { toMYT, myDateStr };
 
 async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
   const TARGET = monthlyTarget || 0;
@@ -2033,7 +1945,7 @@ async function sendDailyEmailIfDue(freshMetrics, force) {
   // block the sales sync from running (or vice versa), so it's wrapped in
   // its own try/catch rather than sharing the outer one.
   try {
-    await checkAssignmentNotifications();
+    await checkAssignmentNotifications(db, notifyDeps);
   } catch (e) {
     console.error("Assignment notification check failed:", e);
   }
