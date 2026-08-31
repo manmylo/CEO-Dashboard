@@ -1853,21 +1853,30 @@ async function runFull() {
   // dailyTrend now spans the sales dashboard's entire history (not capped at
   // 90 days), so it's chunked into its own batches — Firestore caps a single
   // batch at 500 writes, and this collection only grows over time.
-  // Only days inside the Shopify order window have real products/services/
-  // lost figures behind them. dailyTrend spans the sales dashboard's ENTIRE
-  // history, so for anything older those three come out empty -- and a
-  // plain set() would have written that emptiness straight over whatever
-  // was there, silently erasing every day the product backfill had just
-  // repaired. Older days get their relay figures refreshed and nothing
-  // else; merge leaves the fields this run has no business touching alone.
+  // ONLY the order window. dailyTrend spans the sales dashboard's entire
+  // history, but Shopify orders are pulled for ORDER_PULL_DAYS -- so every
+  // older day came out of compute() with products:[], services:[] and an
+  // empty lost, and a plain set() wrote that emptiness straight over the
+  // document. That silently erased anything the product backfill had
+  // repaired, on the very next nightly run.
+  //
+  // Anything past the window is now skipped outright rather than rewritten
+  // with what little this run knows: it is finished history, this run has
+  // nothing new to say about it, and re-stating hundreds of unchanged days
+  // every night was pure write traffic besides. When the sales dashboard
+  // itself is corrected for an old date, FORCE_BACKFILL (the workflow's
+  // "Backfill daily sales history" tick) is the tool that pulls those
+  // figures across -- deliberately a manual act, not a nightly one.
   const orderWindowStart = daysAgoISO(ORDER_PULL_DAYS).slice(0, 10);
   let dailyBatch = db.batch();
   let dailyBatchCount = 0;
+  let dailySkipped = 0;
   for (const day of dailyTrend) {
-    const payload = day.date >= orderWindowStart
-      ? day
-      : { date: day.date, todaySales: day.todaySales, orders: day.orders };
-    dailyBatch.set(db.doc(`daily/${day.date}`), payload, { merge: true });
+    if (day.date < orderWindowStart) { dailySkipped++; continue; }
+    // merge, so a manual product backfill's own markers survive a normal
+    // run. products/services/lost are always set explicitly for these days,
+    // so one that genuinely stops having products still clears.
+    dailyBatch.set(db.doc(`daily/${day.date}`), day, { merge: true });
     dailyBatchCount++;
     if (dailyBatchCount >= 400) {
       await dailyBatch.commit();
@@ -1876,6 +1885,7 @@ async function runFull() {
     }
   }
   if (dailyBatchCount > 0) await dailyBatch.commit();
+  if (dailySkipped) console.log(`Daily trend — wrote from ${orderWindowStart}; left ${dailySkipped} older day(s) untouched.`);
 
   const batch = db.batch();
   batch.set(db.doc("dashboard/latest"), latest);
