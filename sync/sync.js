@@ -397,6 +397,26 @@ function myYesterdayStr() { return myDateStr(new Date(Date.now() - 24 * 60 * 60 
 // file's Firebase and environment setup and can be tested against a fake.
 const notifyDeps = { toMYT, myDateStr };
 
+// Flattens a day's cancellation bucket for storage. Always returns an
+// object, never undefined -- a day with nothing cancelled must still write
+// zeros, or a reader can't tell "nothing was cancelled" from "this day
+// predates the field".
+function lostForDay(bucket) {
+  const rows = (m) => Object.entries(m || {})
+    .map(([pid, p]) => ({ pid, title: p.title, units: p.units, revenue: money(p.revenue) }))
+    .sort((a, b) => b.revenue - a.revenue);
+  const sum = (list, key) => list.reduce((n, x) => n + x[key], 0);
+  const cancelled = rows(bucket?.cancelled);
+  const returned = rows(bucket?.returned);
+  return {
+    cancelledOrders: bucket?.cancelledOrders || 0,
+    returnOrders: bucket?.returnOrders || 0,
+    cancelledUnits: sum(cancelled, "units"), cancelledValue: money(sum(cancelled, "revenue")),
+    returnedUnits: sum(returned, "units"), returnedValue: money(sum(returned, "revenue")),
+    cancelled, returned,
+  };
+}
+
 async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
   const TARGET = monthlyTarget || 0;
   const now = new Date();
@@ -437,6 +457,22 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
   // no server-computed "This Month"/full-window total anymore -- both are
   // summed client-side from these per-day buckets).
   const dailyServiceStats = {}; // { [date]: { [category]: {units, revenue} } }
+  // What was CANCELLED or RETURNED that day, so a day can be read as
+  // "sold this, lost that" rather than a single net figure with the loss
+  // folded invisibly into it.
+  //
+  // `products` above deliberately still counts every line item, cancelled
+  // ones included -- it is the gross book. That is exactly why this is
+  // needed: todaySales comes from the sales dashboard NET of cancellations,
+  // so the two disagree, and with no third number to explain the gap the
+  // Day view showed a gross profit LARGER than its own net sales (126.9%
+  // margin on 30 Aug). Now the gap has a name.
+  //
+  // Same split the monthly stats already use, and for the same reason: this
+  // store also marks genuine post-delivery returns as "cancelled" in
+  // Shopify, so cancelledAt alone can't separate the two. Fulfillment
+  // history can -- never shipped = cancelled, shipped then refunded = return.
+  const dailyLost = {};          // { [date]: { cancelledOrders, returnOrders, cancelled: {pid:{...}}, returned: {pid:{...}} } }
   const dailyProductProfit = {}; // { [date]: { [pid]: {title, profit, revenue, units} } } — lets the
                                   // dashboard's "date range" filter aggregate any custom range client-side
   // Basket analysis ("frequently bought together") — pair co-occurrence counts
@@ -463,6 +499,15 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
     // "Cancelled" = never shipped. "Return" = shipped, then refunded.
     const shipped = (o.fulfillments || []).length > 0;
     if (o.cancelledAt && !shipped) cancelledOrders++;
+
+    const wasCancelled = !!o.cancelledAt && !shipped;
+    const wasReturned = shipped && num(o.totalRefundedSet?.shopMoney?.amount) > 0;
+    const lost = (wasCancelled || wasReturned)
+      ? (dailyLost[createdDateStr] || (dailyLost[createdDateStr] =
+          { cancelledOrders: 0, returnOrders: 0, cancelled: {}, returned: {} }))
+      : null;
+    if (wasCancelled) lost.cancelledOrders++;
+    else if (wasReturned) lost.returnOrders++;
 
     const mstat = monthlyOrderStats[createdMonthKey] || (monthlyOrderStats[createdMonthKey] =
       { month: createdMonthKey, orders: 0, returnOrders: 0, cancelledOrders: 0 });
@@ -549,6 +594,15 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
       dp.profit += lineRev - lineCost;
       dp.revenue += lineRev;
       dp.units += qty;
+
+      // A cancelled order's line items, itemised the same way -- "what was
+      // cancelled that day" has to name the products, not just total them.
+      if (lost) {
+        const into = wasCancelled ? lost.cancelled : lost.returned;
+        const lp = into[pid] || (into[pid] = { title, revenue: 0, units: 0 });
+        lp.revenue += lineRev;
+        lp.units += qty;
+      }
     }
 
     if (basketSet.size > 0) {
@@ -616,6 +670,7 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
       services: Object.entries(dailyServiceStats[d] || {}).map(([category, s]) => ({
         category, units: s.units, revenue: money(s.revenue),
       })),
+      lost: lostForDay(dailyLost[d]),
     }));
 
   // Yesterday's finished total, for the dashboard's live "vs semalam" comparison
