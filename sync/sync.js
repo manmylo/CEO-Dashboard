@@ -1853,10 +1853,21 @@ async function runFull() {
   // dailyTrend now spans the sales dashboard's entire history (not capped at
   // 90 days), so it's chunked into its own batches — Firestore caps a single
   // batch at 500 writes, and this collection only grows over time.
+  // Only days inside the Shopify order window have real products/services/
+  // lost figures behind them. dailyTrend spans the sales dashboard's ENTIRE
+  // history, so for anything older those three come out empty -- and a
+  // plain set() would have written that emptiness straight over whatever
+  // was there, silently erasing every day the product backfill had just
+  // repaired. Older days get their relay figures refreshed and nothing
+  // else; merge leaves the fields this run has no business touching alone.
+  const orderWindowStart = daysAgoISO(ORDER_PULL_DAYS).slice(0, 10);
   let dailyBatch = db.batch();
   let dailyBatchCount = 0;
   for (const day of dailyTrend) {
-    dailyBatch.set(db.doc(`daily/${day.date}`), day);
+    const payload = day.date >= orderWindowStart
+      ? day
+      : { date: day.date, todaySales: day.todaySales, orders: day.orders };
+    dailyBatch.set(db.doc(`daily/${day.date}`), payload, { merge: true });
     dailyBatchCount++;
     if (dailyBatchCount >= 400) {
       await dailyBatch.commit();
@@ -2020,7 +2031,7 @@ async function sendDailyEmailIfDue(freshMetrics, force) {
       console.log("Mode: PRODUCT BACKFILL — skipping the normal sync and the email.");
       await backfillProducts.run({
         db, paginate, Q_ORDERS, pullProducts,
-        myDateStr, num, money, isExcluded, getServiceCategory,
+        myDateStr, num, money, isExcluded, getServiceCategory, lostForDay,
       });
       console.log("Done ✅");
       return;

@@ -47,13 +47,28 @@ function chunks(fromIso, toIso) {
 // a "product day" means. Deliberately NOT re-deriving sales or order counts --
 // those come from the dashboard relay and are already correct.
 function bucketOrders(orders, variantMap, deps) {
-  const { myDateStr, num, money, isExcluded, getServiceCategory } = deps;
+  const { myDateStr, num, money, isExcluded, getServiceCategory, lostForDay } = deps;
   const products = {};   // date -> pid -> { title, profit, revenue, units }
   const services = {};   // date -> category -> { units, revenue }
+  const lost = {};       // date -> { cancelledOrders, returnOrders, cancelled, returned }
 
   for (const o of orders) {
     const created = new Date(o.createdAt);
     const dateStr = myDateStr(created);
+    // Same cancelled/returned split compute() uses -- never shipped is a
+    // cancellation, shipped then refunded is a return. Repeated rather than
+    // shared because this file deliberately takes its dependencies as
+    // arguments and owns no Shopify vocabulary of its own.
+    const shipped = (o.fulfillments || []).length > 0;
+    const wasCancelled = !!o.cancelledAt && !shipped;
+    const wasReturned = shipped && num(o.totalRefundedSet?.shopMoney?.amount) > 0;
+    const lostBucket = (wasCancelled || wasReturned)
+      ? (lost[dateStr] || (lost[dateStr] =
+          { cancelledOrders: 0, returnOrders: 0, cancelled: {}, returned: {} }))
+      : null;
+    if (wasCancelled) lostBucket.cancelledOrders++;
+    else if (wasReturned) lostBucket.returnOrders++;
+
     for (const li of o.lineItems?.nodes || []) {
       if (isExcluded(li.sku)) {
         const category = getServiceCategory(li.sku) || "Other Services";
@@ -75,6 +90,13 @@ function bucketOrders(orders, variantMap, deps) {
       p.profit += lineRev - lineCost;
       p.revenue += lineRev;
       p.units += qty;
+
+      if (lostBucket) {
+        const into = wasCancelled ? lostBucket.cancelled : lostBucket.returned;
+        const lp = into[pid] || (into[pid] = { title, revenue: 0, units: 0 });
+        lp.revenue += lineRev;
+        lp.units += qty;
+      }
     }
   }
   // money() rounds the same way the live path does, so a backfilled day and a
@@ -91,13 +113,15 @@ function bucketOrders(orders, variantMap, deps) {
       category, units: s.units, revenue: money(s.revenue),
     }));
   }
-  return { products: outProducts, services: outServices };
+  const outLost = {};
+  for (const [date, bucket] of Object.entries(lost)) outLost[date] = lostForDay(bucket);
+  return { products: outProducts, services: outServices, lost: outLost };
 }
 
 async function run(deps) {
   const {
     db, paginate, Q_ORDERS, pullProducts,
-    myDateStr, num, money, isExcluded, getServiceCategory,
+    myDateStr, num, money, isExcluded, getServiceCategory, lostForDay,
   } = deps;
   const from = process.env.BACKFILL_PRODUCTS_FROM;
   const to = process.env.BACKFILL_PRODUCTS_TO || myDateStr(new Date());
@@ -110,7 +134,7 @@ async function run(deps) {
   console.log("Fetching product costs…");
   const variantMap = await pullProducts();
 
-  let allProducts = {}, allServices = {}, totalOrders = 0;
+  let allProducts = {}, allServices = {}, allLost = {}, totalOrders = 0;
   for (const c of chunks(from, to)) {
     // created_at is inclusive on both ends here; the <= end date needs the
     // next day's boundary because Shopify compares full timestamps.
@@ -119,9 +143,11 @@ async function run(deps) {
     const orders = await paginate(Q_ORDERS, (d) => d.orders, { q });
     totalOrders += orders.length;
     console.log(`${orders.length} order(s)`);
-    const { products, services } = bucketOrders(orders, variantMap, { myDateStr, num, money, isExcluded, getServiceCategory });
+    const { products, services, lost } = bucketOrders(orders, variantMap,
+      { myDateStr, num, money, isExcluded, getServiceCategory, lostForDay });
     allProducts = { ...allProducts, ...products };
     allServices = { ...allServices, ...services };
+    allLost = { ...allLost, ...lost };
   }
 
   // The guard this whole thing hangs on. Without read_all_orders Shopify
@@ -135,7 +161,7 @@ async function run(deps) {
       + "Nothing was written.");
   }
 
-  const dates = [...new Set([...Object.keys(allProducts), ...Object.keys(allServices)])]
+  const dates = [...new Set([...Object.keys(allProducts), ...Object.keys(allServices), ...Object.keys(allLost)])]
     .filter((d) => d >= from && d <= to)     // orders near a boundary can land outside
     .sort();
 
@@ -146,6 +172,7 @@ async function run(deps) {
     batch.set(db.doc(`daily/${date}`), {
       products: allProducts[date] || [],
       services: allServices[date] || [],
+      lost: allLost[date] || lostForDay(null),
       productsBackfilledAt: new Date().toISOString(),
     }, { merge: true });
     inBatch++; written++;
