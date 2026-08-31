@@ -14,14 +14,51 @@ const ENDPOINT = `https://${SHOP}/admin/api/${VER}/graphql.json`;
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-export async function graphql(query, variables = {}, attempt = 0) {
-  const res = await fetch(ENDPOINT, {
-    method: "POST",
-    headers: { "X-Shopify-Access-Token": TOKEN, "Content-Type": "application/json" },
-    body: JSON.stringify({ query, variables }),
-  });
-  if (res.status === 429) { await sleep(2000); return graphql(query, variables, attempt); }
-  const body = await res.json();
+// Shopify being briefly unreachable is a fact of life on a shared runner --
+// a plain ETIMEDOUT on connect killed an entire 6-chunk product backfill at
+// its very first call, throwing away everything it was about to do. The
+// throttle handling below has always been careful; the network underneath
+// it was not handled at all, and a thrown fetch() propagated straight out.
+const NET_RETRIES = 4;
+const REQUEST_TIMEOUT_MS = 30000;
+const backoffMs = (n) => Math.min(2000 * 2 ** n, 20000);
+
+export async function graphql(query, variables = {}, attempt = 0, netAttempt = 0) {
+  // A retry is only possible if the call actually gives up. Without a
+  // deadline a half-open socket can hang until the whole job times out.
+  const retryNet = async (why) => {
+    if (netAttempt >= NET_RETRIES) throw new Error(`Shopify unreachable after ${NET_RETRIES} retries: ${why}`);
+    const waitMs = backoffMs(netAttempt);
+    console.log(`   [INFO] ${why} — retrying in ${Math.round(waitMs / 1000)}s (attempt ${netAttempt + 1}/${NET_RETRIES})…`);
+    await sleep(waitMs);
+    return graphql(query, variables, attempt, netAttempt + 1);
+  };
+
+  let res;
+  try {
+    res = await fetch(ENDPOINT, {
+      method: "POST",
+      headers: { "X-Shopify-Access-Token": TOKEN, "Content-Type": "application/json" },
+      body: JSON.stringify({ query, variables }),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+  } catch (err) {
+    // ETIMEDOUT / ECONNRESET / socket hang up / our own abort all land here.
+    return retryNet(`Shopify unreachable (${err.cause?.code || err.name || err.message})`);
+  }
+  if (res.status === 429) { await sleep(2000); return graphql(query, variables, attempt, netAttempt); }
+  // 5xx is Shopify having a moment, not a bad query -- same treatment as a
+  // dropped connection rather than a hard failure.
+  if (res.status >= 500) return retryNet(`Shopify HTTP ${res.status}`);
+
+  let body;
+  try {
+    body = await res.json();
+  } catch {
+    // An HTML error page or a truncated response -- retryable, and far more
+    // useful than "Unexpected token < in JSON".
+    return retryNet(`Shopify returned a non-JSON body (HTTP ${res.status})`);
+  }
   if (body.errors) {
     // Shopify can throttle at the GraphQL layer (HTTP 200, but a THROTTLED
     // error in the body) as well as at the HTTP layer (429, handled above).
@@ -37,7 +74,7 @@ export async function graphql(query, variables = {}, attempt = 0) {
         : 2000 * (attempt + 1);
       console.log(`   [INFO] GraphQL THROTTLED, retrying in ${Math.round(waitMs / 1000)}s (attempt ${attempt + 1}/5)…`);
       await sleep(waitMs);
-      return graphql(query, variables, attempt + 1);
+      return graphql(query, variables, attempt + 1, netAttempt);
     }
     throw new Error("GraphQL errors: " + JSON.stringify(body.errors));
   }
