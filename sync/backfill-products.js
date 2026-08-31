@@ -180,8 +180,17 @@ async function run(deps) {
   }
   if (inBatch > 0) await batch.commit();
 
+  // Reported explicitly so a run's log answers "did the cancellations come
+  // through?" on its own, instead of the answer only being visible days
+  // later on a page that may simply be rendering an older document.
+  const lostDays = dates.filter((d) => {
+    const l = allLost[d];
+    return l && (l.cancelledOrders > 0 || l.returnOrders > 0);
+  });
+  const lostValue = lostDays.reduce((n, d) => n + allLost[d].cancelledValue + allLost[d].returnedValue, 0);
   console.log(`Product backfill — ${totalOrders} order(s) across ${written} day(s) written.`);
-  return { totalOrders, days: written, from, to };
+  console.log(`Product backfill — cancellations/returns on ${lostDays.length} day(s), RM${money(lostValue)} total.`);
+  return { totalOrders, days: written, from, to, lostDays: lostDays.length };
 }
 
 export { run, chunks, bucketOrders, addDays };
