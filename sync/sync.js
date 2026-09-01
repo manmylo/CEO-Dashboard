@@ -61,8 +61,80 @@ const DEADSTOCK_WINDOW_DAYS = 90;
 // alongside the lookup logic that uses it.
 const LOW_STOCK_DAYS = 14;      // stockout warning threshold (inclusion cutoff)
 const CRITICAL_STOCK_DAYS = 7;  // <= this many days left = "kritikal" tier, else "amaran"
-const REORDER_LEAD_DAYS = 14;   // assumed supplier lead time for reorder-quantity suggestion
-const REORDER_BUFFER_DAYS = 30; // extra buffer stock to hold on top of lead time
+// FALLBACKS, used only for a supplier nobody has filled in yet. Real lead
+// times and MOQs live in config/suppliers, keyed by the Shopify vendor name,
+// and are edited on the Suppliers page. A single global lead time meant a
+// German manufacturer and a KL warehouse were assumed identical, so every
+// reorder point downstream inherited whichever one was wrong.
+const REORDER_LEAD_DAYS = 14;   // default supplier lead time, days
+const REORDER_BUFFER_DAYS = 30; // default safety-stock buffer, days of cover
+
+// Supplier terms, merged over the defaults above.
+// { "F. Dick": { leadDays: 90, moq: 12, minOrderValue: 5000 }, ... }
+async function loadSupplierTerms() {
+  try {
+    const snap = await db.doc("config/suppliers").get();
+    return snap.exists ? (snap.data().vendors || {}) : {};
+  } catch (e) {
+    console.warn(`Supplier terms unavailable (using defaults): ${e.message}`);
+    return {};
+  }
+}
+function termsFor(supplierTerms, vendor) {
+  const t = supplierTerms[vendor] || {};
+  return {
+    leadDays: Number(t.leadDays) > 0 ? Number(t.leadDays) : REORDER_LEAD_DAYS,
+    bufferDays: Number(t.bufferDays) > 0 ? Number(t.bufferDays) : REORDER_BUFFER_DAYS,
+    moq: Number(t.moq) > 0 ? Number(t.moq) : 0,
+    minOrderValue: Number(t.minOrderValue) > 0 ? Number(t.minOrderValue) : 0,
+    // true once someone has actually entered terms, so the UI can mark the
+    // rest as still running on a guess rather than presenting them as fact.
+    known: !!(Number(t.leadDays) > 0),
+  };
+}
+
+// A supplier will not sell you 3 units if their minimum is 12. Rounding UP
+// to the next whole multiple is what makes a suggested quantity actually
+// orderable; leaving it raw produced numbers nobody could place.
+function applyMoq(qty, moq) {
+  if (qty <= 0) return 0;
+  if (!moq || moq <= 1) return qty;
+  return Math.ceil(qty / moq) * moq;
+}
+
+// Stock that is bought but not yet in the building -- "Pipeline Stock" in the
+// glossary. Summed per SKU from Purchase Order cards that have NOT been
+// marked Arrived.
+//
+// Without this a SKU reads "out of stock, order 40" while a PO covering it
+// lands on Friday, and somebody orders it twice. The Calendar has carried
+// this data all along; nothing was reading it.
+async function loadPipelineBySku() {
+  const bySku = new Map();
+  try {
+    const snap = await db.collection("calendarCards").where("cardType", "==", "po").get();
+    let openPos = 0;
+    snap.forEach((docSnap) => {
+      const c = docSnap.data();
+      if (c.arrived) return;                       // already counted in on-hand
+      openPos++;
+      for (const it of c.items || []) {
+        if (!it.sku) continue;
+        const qty = num(it.quantity);
+        if (qty <= 0) continue;
+        const cur = bySku.get(it.sku) || { units: 0, eta: null, po: c.title || "" };
+        cur.units += qty;
+        // The SOONEST arrival is the one that matters for "can I wait?".
+        if (c.date && (!cur.eta || c.date < cur.eta)) { cur.eta = c.date; cur.po = c.title || ""; }
+        bySku.set(it.sku, cur);
+      }
+    });
+    console.log(`Pipeline — ${openPos} open PO(s), ${bySku.size} SKU(s) with stock inbound.`);
+  } catch (e) {
+    console.warn(`Pipeline stock unavailable (treated as zero): ${e.message}`);
+  }
+  return bySku;
+}
 const EMAIL_HOUR_MYT = 8;       // send the daily report on the first run at/after this MYT hour
 const AT_RISK_DAYS = 180;       // repeat customer with no order in this long = at-risk (~6 months)
 const VIP_COUNT = 25;           // top N customers by lifetime spend
@@ -765,6 +837,14 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
     },
   };
 
+  // Read once, before the loop -- every row below consults them.
+  const supplierTerms = await loadSupplierTerms();
+  const pipelineBySku = await loadPipelineBySku();
+  // Every vendor the catalogue actually contains, so the Suppliers page can
+  // list them without anyone typing a name in by hand (and without it ever
+  // drifting from what Shopify says).
+  const vendorStats = new Map();
+
   const deadStockCandidates = [], slowMoving = [], stockAlerts = [], stockOut = [];
   for (const [vid, v] of variantMap) {
     // Draft/archived products aren't on sale, so they can't be "dead"
@@ -792,6 +872,14 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
     // Same reasoning as computeInventory()'s own `v.tracked` check, which has
     // always skipped these when totalling inventory value.
     if (!v.tracked) continue;
+
+    const vend = v.vendor || "(no vendor set)";
+    const vs = vendorStats.get(vend) || { name: vend, skus: 0, onHandUnits: 0, capital: 0 };
+    vs.skus++;
+    vs.onHandUnits += Math.max(0, v.inventory);
+    vs.capital += Math.max(0, v.inventory) * v.cost;
+    vendorStats.set(vend, vs);
+
     const sold90 = soldUnits90[vid] || 0;
     const sold30 = soldUnits30[vid] || 0;
     const sold7 = soldUnits7[vid] || 0;
@@ -824,9 +912,24 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
       // (same free lookup off the already-fetched variant, no extra API
       // call) so the dashboard's Slow Moving / Overstock exports can carry
       // the exact same rich column set Dead Stock's own export does.
+      // Excess Stock Value -- the glossary's #21, and the one it singles out
+      // for cash-flow recovery: how many ringgit are actually TRAPPED above
+      // what this SKU needs to hold.
+      //   Target Stock  = velocity x (lead time + safety buffer)   [#18]
+      //   Excess Units  = Current Stock - Target Stock             [#20]
+      //   Excess Value  = Excess Units x Unit Cost                 [#21]
+      // `capital` beside it is the whole holding; excess is the removable
+      // part of it. Overstock could say WHICH SKUs were overstocked but
+      // never how much money that was, which is the number a markdown or
+      // liquidation decision actually turns on.
+      const t = termsFor(supplierTerms, v.vendor);
+      const targetStock = velocity > 0 ? Math.ceil(velocity * (t.leadDays + t.bufferDays)) : 0;
+      const excessUnits = Math.max(0, v.inventory - targetStock);
       slowMoving.push({ title: v.productTitle, sku: v.sku, onHand: v.inventory,
         vendor: v.vendor, cost: money(v.cost), price: money(v.price),
-        capital: money(v.inventory * v.cost), sold90, dsi: Math.round(dsi) });
+        capital: money(v.inventory * v.cost), sold90, dsi: Math.round(dsi),
+        leadDays: t.leadDays, leadKnown: t.known,
+        targetStock, excessUnits, excessValue: money(excessUnits * v.cost) });
     }
 
     // Already out of stock (zero or negative — Shopify allows negative
@@ -840,10 +943,19 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
     // titles (services, kydex, etc.) are excluded, same scope as the
     // inventory-value calc.
     if (v.inventory <= 0 && !isInventoryExcludedTitle(v.productTitle)) {
-      const targetStock = velocity > 0 ? Math.ceil(velocity * (REORDER_LEAD_DAYS + REORDER_BUFFER_DAYS)) : 0;
+      const t = termsFor(supplierTerms, v.vendor);
+      const inbound = pipelineBySku.get(v.sku) || null;
+      const targetStock = velocity > 0 ? Math.ceil(velocity * (t.leadDays + t.bufferDays)) : 0;
+      // Net off what is already on its way. A SKU with 40 units landing on
+      // Friday is not a SKU to order 40 more of today.
+      const shortfall = Math.max(0, targetStock - v.inventory - (inbound?.units || 0));
       stockOut.push({
         title: v.productTitle, sku: v.sku, onHand: v.inventory, sold30,
-        reorderQty: Math.max(0, targetStock - v.inventory),
+        vendor: v.vendor || "",
+        leadDays: t.leadDays, leadKnown: t.known,
+        incoming: inbound?.units || 0, incomingEta: inbound?.eta || null, incomingPo: inbound?.po || "",
+        targetStock,
+        reorderQty: applyMoq(shortfall, t.moq),
         price: v.price, // kept for the business-analysis "revenue at risk" estimate; not shown in the table
       });
       continue;
@@ -856,14 +968,20 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
     if (sold30 > 0 && v.inventory > 0) {
       const daysLeft = Math.floor(v.inventory / velocity);
       if (daysLeft <= LOW_STOCK_DAYS) {
+        const t = termsFor(supplierTerms, v.vendor);
+        const inbound = pipelineBySku.get(v.sku) || null;
         const trend = velocity7 > velocity30 * 1.2 ? "up" : velocity7 < velocity30 * 0.8 ? "down" : "steady";
         const stockoutDate = myDateStr(new Date(now.getTime() + daysLeft * 864e5));
-        const targetStock = Math.ceil(velocity * (REORDER_LEAD_DAYS + REORDER_BUFFER_DAYS));
-        const reorderQty = Math.max(0, targetStock - v.inventory);
+        const targetStock = Math.ceil(velocity * (t.leadDays + t.bufferDays));
+        const shortfall = Math.max(0, targetStock - v.inventory - (inbound?.units || 0));
         stockAlerts.push({
           title: v.productTitle, sku: v.sku, onHand: v.inventory, daysLeft, stockoutDate, trend,
           urgency: daysLeft <= CRITICAL_STOCK_DAYS ? "critical" : "warning",
-          reorderQty,
+          vendor: v.vendor || "",
+          leadDays: t.leadDays, leadKnown: t.known,
+          incoming: inbound?.units || 0, incomingEta: inbound?.eta || null, incomingPo: inbound?.po || "",
+          targetStock,
+          reorderQty: applyMoq(shortfall, t.moq),
         });
       }
     }
@@ -936,6 +1054,18 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
     topProducts, topProductsMTD, totalProfit90: money(totalProfit90), // topProducts = full 90-day window (dashboard default); MTD = email only
     deadStock, slowMoving, stockAlerts: stockAlerts.slice(0, 20),
     stockOut, // deadStock/stockOut unsliced — dashboard shows first 20 with a "see more" toggle for the rest
+    // Headline cash-flow figures, so the dashboard doesn't have to re-add the
+    // rows to answer "how much money is stuck?".
+    excessStockValue: money(slowMoving.reduce((n, r) => n + (r.excessValue || 0), 0)),
+    excessStockSkus: slowMoving.filter((r) => (r.excessUnits || 0) > 0).length,
+    deadStockValue: money(deadStock.reduce((n, r) => n + (r.capital || 0), 0)),
+    // Suppliers seen in the catalogue + whether anyone has set their terms.
+    // Feeds the Suppliers page's list; the terms themselves live in
+    // config/suppliers, which this only reads.
+    vendors: [...vendorStats.values()]
+      .map((x) => ({ ...x, capital: money(x.capital), ...termsFor(supplierTerms, x.name), }))
+      .sort((a, b) => b.capital - a.capital),
+    pipelineSkus: pipelineBySku.size,
     basketAnalysis, // "frequently bought together" — top pairs by lift, 90-day window
     ...computeInventory(variantMap),
     dailyTrend, monthlyOrderTrend, concentrationByPeriod, unitsBySkuDate, // all merged into businessAnalysis in runFull(), not written to dashboard/latest directly
