@@ -69,26 +69,42 @@ const CRITICAL_STOCK_DAYS = 7;  // <= this many days left = "kritikal" tier, els
 const REORDER_LEAD_DAYS = 14;   // default supplier lead time, days
 const REORDER_BUFFER_DAYS = 30; // default safety-stock buffer, days of cover
 
-// Supplier terms, merged over the defaults above.
-// { "F. Dick": { leadDays: 90, moq: 12, minOrderValue: 5000 }, ... }
+// Supplier terms.
+//
+// A SUPPLIER is who you place the order with -- a distributor, who may carry
+// several brands. Shopify's `vendor` field is the BRAND, which is not the
+// same thing: one distributor can supply F. Dick and Giesser both, and the
+// terms belong to the distributor.
+//
+// So config/suppliers holds two things: the suppliers themselves, and a map
+// from each Shopify brand to the supplier it is bought through. A brand
+// with no mapping falls back to the defaults above.
+//
+//   { suppliers: { "<id>": { name, leadDays, bufferDays, moq, minOrderValue } },
+//     brandMap:  { "F. Dick": "<id>", "Giesser": "<id>" } }
 async function loadSupplierTerms() {
   try {
     const snap = await db.doc("config/suppliers").get();
-    return snap.exists ? (snap.data().vendors || {}) : {};
+    const d = snap.exists ? snap.data() : {};
+    return { suppliers: d.suppliers || {}, brandMap: d.brandMap || {} };
   } catch (e) {
     console.warn(`Supplier terms unavailable (using defaults): ${e.message}`);
-    return {};
+    return { suppliers: {}, brandMap: {} };
   }
 }
-function termsFor(supplierTerms, vendor) {
-  const t = supplierTerms[vendor] || {};
+function termsFor(cfg, vendor) {
+  const id = cfg.brandMap?.[vendor] || null;
+  const t = (id && cfg.suppliers?.[id]) || {};
   return {
+    supplierId: id,
+    supplierName: t.name || "",
     leadDays: Number(t.leadDays) > 0 ? Number(t.leadDays) : REORDER_LEAD_DAYS,
     bufferDays: Number(t.bufferDays) > 0 ? Number(t.bufferDays) : REORDER_BUFFER_DAYS,
     moq: Number(t.moq) > 0 ? Number(t.moq) : 0,
     minOrderValue: Number(t.minOrderValue) > 0 ? Number(t.minOrderValue) : 0,
-    // true once someone has actually entered terms, so the UI can mark the
-    // rest as still running on a guess rather than presenting them as fact.
+    // true once this brand is mapped to a supplier that has a real lead time,
+    // so the UI can mark everything else as still running on the default
+    // rather than presenting a guess as fact.
     known: !!(Number(t.leadDays) > 0),
   };
 }
@@ -1062,8 +1078,11 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
     // Suppliers seen in the catalogue + whether anyone has set their terms.
     // Feeds the Suppliers page's list; the terms themselves live in
     // config/suppliers, which this only reads.
+    // One row per BRAND, carrying whichever supplier it is mapped to. The
+    // Suppliers page renders both halves from this: the brands needing a
+    // supplier, and what each supplier ends up covering.
     vendors: [...vendorStats.values()]
-      .map((x) => ({ ...x, capital: money(x.capital), ...termsFor(supplierTerms, x.name), }))
+      .map((x) => ({ ...x, capital: money(x.capital), ...termsFor(supplierTerms, x.name) }))
       .sort((a, b) => b.capital - a.capital),
     pipelineSkus: pipelineBySku.size,
     basketAnalysis, // "frequently bought together" — top pairs by lift, 90-day window
