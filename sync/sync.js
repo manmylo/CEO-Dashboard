@@ -1217,6 +1217,36 @@ function computeBusinessAnalysis({ dailyTrend, monthlyOrderTrend, deadStock, sto
 // sentence either side. Still throws (letting the caller's existing rule-based
 // fallback take over) if neither parse succeeds, so a genuinely broken/empty
 // response doesn't silently produce garbage.
+// One retry, with the instruction made blunt.
+//
+// The call below already asks for response_format: json_schema (strict) and
+// the provider ignores it -- this run came back "Here's a clear business
+// summary and recommended actions..." with no brace anywhere in it, so
+// extractJson had nothing to salvage and BOTH the insights and the strategic
+// analysis fell through to the rule-based fallback on the same run.
+//
+// Re-asking with the model's own prose quoted back at it is cheap (a few
+// seconds, reasoning is already disabled) and far more likely to work than
+// trusting a constraint this provider has repeatedly not honoured.
+async function askForJson(client, params, label) {
+  const call = async (messages) => {
+    const res = await client.chat.completions.create({ ...params, messages });
+    return res.choices?.[0]?.message?.content || "";
+  };
+  const first = await call(params.messages);
+  try {
+    return extractJson(first);
+  } catch (err) {
+    console.log(`   [INFO] ${label}: no JSON in the reply, asking again more bluntly…`);
+    const second = await call([
+      ...params.messages,
+      { role: "assistant", content: first.slice(0, 400) },
+      { role: "user", content: "That reply contained no JSON. Reply with the JSON object ONLY -- no explanation, no preamble, no markdown fences. Start your reply with { and end it with }." },
+    ]);
+    return extractJson(second);   // still bad -> caller's rule-based fallback
+  }
+}
+
 function extractJson(content) {
   try {
     return JSON.parse(content);
@@ -1242,7 +1272,7 @@ async function generateAIInsights(context) {
 
   try {
     const rootsys = new OpenAI({ baseURL: "https://rootsys.cloud/v1", apiKey: process.env.ROOTSYS_API_KEY });
-    const response = await rootsys.chat.completions.create({
+    const params = {
       model: "hy3-tencent",
       // hy3-tencent is a reasoning model -- left enabled, a single call here
       // burned 150-180K reasoning tokens and took ~60s for output that's
@@ -1293,14 +1323,9 @@ Exact shape (each observation is one string in the array):
           },
         },
       },
-    });
+    };
 
-    const content = response.choices?.[0]?.message?.content;
-    if (!content) {
-      console.log(`AI insights skipped: no content in response (finish_reason: ${response.choices?.[0]?.finish_reason}), using rule-based fallback.`);
-      return null;
-    }
-    const parsed = extractJson(content);
+    const parsed = await askForJson(rootsys, params, "AI insights");
     if (!parsed || !Array.isArray(parsed.insights) || !parsed.insights.length) {
       console.log(`AI insights skipped: response had no usable "insights" array, using rule-based fallback.`);
       return null;
@@ -1324,7 +1349,7 @@ async function generateStrategicAnalysis(context) {
 
   try {
     const rootsys = new OpenAI({ baseURL: "https://rootsys.cloud/v1", apiKey: process.env.ROOTSYS_API_KEY });
-    const response = await rootsys.chat.completions.create({
+    const params = {
       model: "hy3-tencent",
       // See generateAIInsights()'s comment above -- reasoning left enabled
       // turns this into a ~60s call for no quality gain.
@@ -1381,14 +1406,9 @@ Exact shape (each observation is one string in the array; put the DECIDE NOW / W
           },
         },
       },
-    });
+    };
 
-    const content = response.choices?.[0]?.message?.content;
-    if (!content) {
-      console.log(`Strategic analysis skipped: no content in response (finish_reason: ${response.choices?.[0]?.finish_reason}).`);
-      return null;
-    }
-    const parsed = extractJson(content);
+    const parsed = await askForJson(rootsys, params, "Strategic analysis");
     if (!parsed || !Array.isArray(parsed.analysis) || !parsed.analysis.length) {
       console.log(`Strategic analysis skipped: response had no usable "analysis" array.`);
       return null;
@@ -2028,7 +2048,7 @@ async function runFull() {
   }
   batch.set(db.doc("sync/state"), { lastFullSyncDate: metrics.date, lastFullSyncAt: metrics.generatedAt });
   await batch.commit();
-  console.log(`Full sync — dashboard/latest + ${dailyTrend.length} daily docs + ${latest.businessAnalysis.monthlyTrend.length} monthly docs.`);
+  console.log(`Full sync — dashboard/latest + ${dailyTrend.length - dailySkipped} daily docs + ${latest.businessAnalysis.monthlyTrend.length} monthly docs.`);
   // Non-fatal on purpose -- D90 is a side feature, and a failure here must
   // never take down the sales sync that just finished writing.
   try {
