@@ -860,6 +860,7 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
   // list them without anyone typing a name in by hand (and without it ever
   // drifting from what Shopify says).
   const vendorStats = new Map();
+  const skuStock = {};
 
   const deadStockCandidates = [], slowMoving = [], stockAlerts = [], stockOut = [];
   for (const [vid, v] of variantMap) {
@@ -888,6 +889,13 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
     // Same reasoning as computeInventory()'s own `v.tracked` check, which has
     // always skipped these when totalling inventory value.
     if (!v.tracked) continue;
+
+    // On-hand per SKU, for the D90 export's "stock before this PO landed"
+    // column. That figure is only knowable at the moment a Purchase Order is
+    // marked Arrived -- afterwards the arrival has already been added to
+    // stock and the number is gone -- so the browser needs somewhere to read
+    // it from at exactly that instant. Nothing else consumes it.
+    if (v.sku) skuStock[v.sku] = v.inventory;
 
     const vend = v.vendor || "(no vendor set)";
     const vs = vendorStats.get(vend) || { name: vend, skus: 0, onHandUnits: 0, capital: 0 };
@@ -1085,6 +1093,7 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
       .map((x) => ({ ...x, capital: money(x.capital), ...termsFor(supplierTerms, x.name) }))
       .sort((a, b) => b.capital - a.capital),
     pipelineSkus: pipelineBySku.size,
+    skuStock,
     basketAnalysis, // "frequently bought together" — top pairs by lift, 90-day window
     ...computeInventory(variantMap),
     dailyTrend, monthlyOrderTrend, concentrationByPeriod, unitsBySkuDate, // all merged into businessAnalysis in runFull(), not written to dashboard/latest directly
@@ -1503,7 +1512,7 @@ async function updateD90Tracking(unitsBySkuDate) {
 // unconfigured-EmailJS) run doesn't get silently marked "sent" for the day
 // and then skip the real send once recipients are actually ticked later.
 // Yesterday's own daily target -- a Calendar "Sales Target" card
-// (calendarCards, the same docs the Target Planner's Export to Calendar
+// (calendarCards, the same docs the Sales Target's Export to Calendar
 // writes). getCurrentMonthTarget() above is the MONTHLY figure from
 // yearlyCards and can't answer "did we hit it yesterday", which is what
 // decides whether the email's headline goes red.
