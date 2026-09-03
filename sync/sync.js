@@ -860,7 +860,7 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
   // list them without anyone typing a name in by hand (and without it ever
   // drifting from what Shopify says).
   const vendorStats = new Map();
-  const skuStock = {};
+  const skuStock = {}, skuCost = {};
 
   const deadStockCandidates = [], slowMoving = [], stockAlerts = [], stockOut = [];
   for (const [vid, v] of variantMap) {
@@ -895,7 +895,12 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
     // marked Arrived -- afterwards the arrival has already been added to
     // stock and the number is gone -- so the browser needs somewhere to read
     // it from at exactly that instant. Nothing else consumes it.
-    if (v.sku) skuStock[v.sku] = v.inventory;
+    // Alongside it, Shopify's own unit cost (inventoryItem.unitCost), which
+    // is what the D90 export values stock at. Kept here rather than read from
+    // the Purchase Order, because the PO records what was paid for ONE
+    // shipment while this is the cost Shopify carries the item at today --
+    // the same number its own inventory-value reports use, so the two agree.
+    if (v.sku) { skuStock[v.sku] = v.inventory; skuCost[v.sku] = money(v.cost); }
 
     const vend = v.vendor || "(no vendor set)";
     const vs = vendorStats.get(vend) || { name: vend, skus: 0, onHandUnits: 0, capital: 0 };
@@ -1093,7 +1098,7 @@ async function compute({ variantMap, orders, monthlyTarget, dashboardDaily }) {
       .map((x) => ({ ...x, capital: money(x.capital), ...termsFor(supplierTerms, x.name) }))
       .sort((a, b) => b.capital - a.capital),
     pipelineSkus: pipelineBySku.size,
-    skuStock,
+    skuStock, skuCost,
     basketAnalysis, // "frequently bought together" — top pairs by lift, 90-day window
     ...computeInventory(variantMap),
     dailyTrend, monthlyOrderTrend, concentrationByPeriod, unitsBySkuDate, // all merged into businessAnalysis in runFull(), not written to dashboard/latest directly
@@ -1526,14 +1531,13 @@ async function getDailyTargetFor(dateStr) {
     return 0;
   }
 }
-// "2026-08-21" -> "21 Aug 2026". Built from the parts rather than a Date
-// object, which would re-interpret the string in UTC and can show the day
-// before in a positive-offset timezone.
-const EMAIL_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+// "2026-08-21" -> "21/08/2026", matching the dashboard. Built from the parts
+// rather than a Date object, which would re-interpret the string in UTC and
+// can show the day before in a positive-offset timezone.
 function fmtEmailDate(dateStr) {
   const m = String(dateStr || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (!m) return String(dateStr || "");
-  return `${Number(m[3])} ${EMAIL_MONTHS[Number(m[2]) - 1]} ${m[1]}`;
+  return `${m[3]}/${m[2]}/${m[1]}`;
 }
 function emailEscape(s) {
   return String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
