@@ -352,3 +352,197 @@ exports.changeUserEmail = onCall({ timeoutSeconds: 300 }, async (request) => {
   logger.info(`changeUserEmail: ${oldEmail} -> ${newEmail} done, ${batcher.total} document(s) touched across queried collections`);
   return { ok: true, documentsUpdated: batcher.total };
 });
+
+/* =====================================================================
+ * OTP-gated deletion
+ * =====================================================================
+ * Some deletions are permanent and wide: a Database file takes its Drive
+ * copy with it, a D90 entry takes the only record of how a restock
+ * actually performed. Firestore has no undo, so those two now need a code
+ * emailed to the admin doing it before they go through.
+ *
+ * The delete itself happens HERE, with the Admin SDK, and firestore.rules
+ * refuses client deletes on these collections outright. That ordering is
+ * the whole point -- an OTP in front of a delete the browser could still
+ * perform on its own is theatre, not a control.
+ *
+ * Only a HASH of the code is stored. Someone who can read the pending
+ * record (an admin, via the console) still cannot use it.
+ */
+const crypto = require("crypto");
+
+// Which collections may be deleted this way, and what to call them in the
+// email. An allowlist, so a caller can't hand this function an arbitrary
+// path and have it delete whatever it likes.
+const OTP_DELETABLE = {
+  forms: { label: "Database file", titleField: "title", altTitleField: "fileName" },
+  d90Tracking: { label: "D90 entry", titleField: "poTitle", altTitleField: "supplier" },
+  // Stock Arrival cards. Deleting one destroys its D90 entry too (see the
+  // cleanupD90OnCardDelete trigger below), so the code is required here as
+  // well -- otherwise the D90 gate could simply be walked around from the
+  // Calendar. Ordinary calendar cards are NOT in this list and delete
+  // normally; the rule only diverts cardType == "po".
+  calendarCards: { label: "Stock Arrival", titleField: "title", altTitleField: "description" },
+};
+
+const OTP_TTL_MS = 10 * 60 * 1000;   // long enough to find the email, short enough to matter
+const OTP_MAX_ATTEMPTS = 5;
+
+const sha256 = (s) => crypto.createHash("sha256").update(String(s)).digest("hex");
+
+async function assertAdmin(request) {
+  const callerEmail = (request.auth?.token?.email || "").toLowerCase();
+  if (!request.auth || !request.auth.token.email_verified || !callerEmail) {
+    throw new HttpsError("unauthenticated", "Sign in required.");
+  }
+  const db = admin.firestore();
+  const accessSnap = await db.doc("config/access").get();
+  const accessData = accessSnap.exists ? accessSnap.data() : {};
+  const realAdmins = (accessData.admins || []).map((e) => e.toLowerCase());
+  const pageAccessSnap = await db.doc("config/pageAccess").get();
+  const caps = (pageAccessSnap.exists ? pageAccessSnap.data() : {})[callerEmail] || [];
+  const isAdmin = realAdmins.includes(callerEmail) || caps.includes("settings");
+  if (!isAdmin) throw new HttpsError("permission-denied", "Only an admin can delete this.");
+  // realAdmins doubles as the cc list -- whoever owns the dashboard sees
+  // every deletion attempt, which is most of the value of doing this at all.
+  return { callerEmail, ccList: realAdmins.filter((e) => e !== callerEmail) };
+}
+
+async function sendOtpEmail({ to, cc, code, label, title, privateKey }) {
+  const body = [
+    `Someone (you, we hope) asked to permanently delete a ${label} on the Gearevo dashboard.`,
+    "",
+    `   ${label}: ${title}`,
+    `   Code: ${code}`,
+    "",
+    "Enter that code on the dashboard to confirm. It expires in 10 minutes.",
+    "",
+    "This cannot be undone once confirmed. If you did not start this, do not enter",
+    "the code -- and tell whoever runs the dashboard, because it means someone else",
+    "has your account.",
+  ].join("\n");
+  const res = await fetch("https://api.emailjs.com/api/v1.0/email/send", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      service_id: "service_054vq8u",
+      template_id: "template_hg1929y",
+      user_id: "TZtrlxFe5-gRj2fdJ",
+      accessToken: privateKey,
+      template_params: {
+        to_email: to,
+        bcc_emails: (cc || []).join(","),
+        email: to,
+        header: "CONFIRM DELETION",
+        subject: `Confirm deletion: ${title}`,
+        message: body,
+        message_html: body.replace(/\n/g, "<br>"),
+      },
+    }),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new HttpsError("internal", `Couldn't send the code: ${res.status} ${text.slice(0, 120)}`);
+  }
+}
+
+const { defineSecret } = require("firebase-functions/params");
+const EMAILJS_PRIVATE_KEY = defineSecret("EMAILJS_PRIVATE_KEY");
+
+exports.requestDeleteOtp = onCall({ secrets: [EMAILJS_PRIVATE_KEY] }, async (request) => {
+  const { callerEmail, ccList } = await assertAdmin(request);
+  const collection = String(request.data?.collection || "");
+  const docId = String(request.data?.docId || "");
+  const spec = OTP_DELETABLE[collection];
+  if (!spec) throw new HttpsError("invalid-argument", "That kind of record isn't deletable this way.");
+  if (!docId) throw new HttpsError("invalid-argument", "Nothing to delete.");
+
+  const db = admin.firestore();
+  const snap = await db.doc(`${collection}/${docId}`).get();
+  if (!snap.exists) throw new HttpsError("not-found", "That record is already gone.");
+  const data = snap.data() || {};
+  const title = data[spec.titleField] || data[spec.altTitleField] || docId;
+
+  // 6 digits, from a CSPRNG rather than Math.random.
+  const code = String(crypto.randomInt(0, 1000000)).padStart(6, "0");
+  const pendingId = crypto.randomUUID();
+  await db.doc(`deleteOtp/${pendingId}`).set({
+    collection, docId, title,
+    requestedBy: callerEmail,
+    codeHash: sha256(code),          // never the code itself
+    attempts: 0,
+    createdAt: new Date().toISOString(),
+    expiresAt: Date.now() + OTP_TTL_MS,
+    expireAt: new Date(Date.now() + 24 * 3600e3),   // Firestore TTL sweeps the record
+  });
+
+  await sendOtpEmail({
+    to: callerEmail, cc: ccList, code, label: spec.label, title,
+    privateKey: EMAILJS_PRIVATE_KEY.value(),
+  });
+  logger.info(`requestDeleteOtp: ${callerEmail} -> ${collection}/${docId} ("${title}")`);
+  return { pendingId, sentTo: callerEmail, ccCount: ccList.length, label: spec.label, title };
+});
+
+exports.confirmDelete = onCall(async (request) => {
+  const { callerEmail } = await assertAdmin(request);
+  const pendingId = String(request.data?.pendingId || "");
+  const code = String(request.data?.code || "").trim();
+  if (!pendingId || !code) throw new HttpsError("invalid-argument", "Code required.");
+
+  const db = admin.firestore();
+  const ref = db.doc(`deleteOtp/${pendingId}`);
+  const snap = await ref.get();
+  if (!snap.exists) throw new HttpsError("not-found", "That request has expired — start again.");
+  const p = snap.data();
+
+  // The person confirming must be the person who asked. Otherwise one
+  // admin's emailed code could be used by another.
+  if (p.requestedBy !== callerEmail) throw new HttpsError("permission-denied", "That code was issued to someone else.");
+  if (Date.now() > p.expiresAt) { await ref.delete(); throw new HttpsError("deadline-exceeded", "That code has expired — start again."); }
+  if ((p.attempts || 0) >= OTP_MAX_ATTEMPTS) { await ref.delete(); throw new HttpsError("resource-exhausted", "Too many wrong codes — start again."); }
+
+  if (sha256(code) !== p.codeHash) {
+    await ref.update({ attempts: (p.attempts || 0) + 1 });
+    throw new HttpsError("permission-denied", `Wrong code. ${OTP_MAX_ATTEMPTS - (p.attempts || 0) - 1} attempt(s) left.`);
+  }
+
+  await db.doc(`${p.collection}/${p.docId}`).delete();
+  await ref.delete();
+  // A permanent record that this happened, in the same log the access
+  // changes already write to.
+  await db.collection("accessLog").add({
+    at: new Date().toISOString(),
+    actor: callerEmail,
+    target: `${p.collection}/${p.docId}`,
+    item: p.title,
+    action: "delete",
+    detail: `Confirmed by emailed code. ${p.collection} — "${p.title}".`,
+  });
+  logger.info(`confirmDelete: ${callerEmail} deleted ${p.collection}/${p.docId} ("${p.title}")`);
+  return { ok: true, title: p.title };
+});
+
+/**
+ * A PO card carries its D90 entry with it when deleted -- an orphan would
+ * keep showing a Purchase Order that exists nowhere else.
+ *
+ * This used to run in the browser (calendar.js's deleteD90Entries), which
+ * forced d90Tracking to allow client deletes by ANY allowed user -- and
+ * that open rule is exactly what would have let someone walk around the
+ * OTP on the D90 page. Moving the cascade here makes it a system action
+ * rather than a user one, so the collection can refuse client deletes
+ * outright while the cleanup still happens.
+ */
+const { onDocumentDeleted } = require("firebase-functions/v2/firestore");
+
+exports.cleanupD90OnCardDelete = onDocumentDeleted("calendarCards/{cardId}", async (event) => {
+  const cardId = event.params.cardId;
+  const db = admin.firestore();
+  const snap = await db.collection("d90Tracking").where("poCardId", "==", cardId).get();
+  if (snap.empty) return;
+  const batch = db.batch();
+  snap.docs.forEach((d) => batch.delete(d.ref));
+  await batch.commit();
+  logger.info(`cleanupD90OnCardDelete: card ${cardId} -> removed ${snap.size} D90 entr(ies)`);
+});
