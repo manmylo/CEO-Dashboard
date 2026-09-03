@@ -73,6 +73,15 @@ export async function graphql(query, variables = {}, attempt = 0, netAttempt = 0
   // 5xx is Shopify having a moment, not a bad query -- same treatment as a
   // dropped connection rather than a hard failure.
   if (res.status >= 500) return retryNet(`Shopify HTTP ${res.status}`);
+  // Nothing is wrong with the request: Shopify has cut the store off. It
+  // answers 402 "Unavailable Shop" when a store is frozen for unpaid billing,
+  // paused, or closed -- the Admin API goes dark along with the storefront.
+  // Retrying cannot help, and the fix is in the Shopify account, not here.
+  if (res.status === 402) {
+    throw new Error(`Shopify says the store is unavailable (HTTP 402) — it is frozen, paused or `
+      + `closed, which also takes the storefront down. Check Settings > Plan in Shopify admin and `
+      + `settle any outstanding invoice; the sync will work again as soon as the store is active.`);
+  }
   // Not retryable, and no amount of parsing the body makes it clearer: the
   // credentials themselves are the problem.
   if (res.status === 401 || res.status === 403) {
