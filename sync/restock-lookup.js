@@ -23,6 +23,29 @@ const NET_RETRIES = 4;
 const REQUEST_TIMEOUT_MS = 30000;
 const backoffMs = (n) => Math.min(2000 * 2 ** n, 20000);
 
+// Shopify does not always answer with the array of {message, extensions}
+// objects the GraphQL spec describes, and the shape it picks depends on WHERE
+// the request died:
+//
+//   array   a real GraphQL error -- throttling, a bad field, a bad id
+//   string  rejected before the parser ran: {"errors":"[API] Invalid API key
+//           or access token (unrecognized login or wrong password)"}
+//   object  the parser rejected the query: {"errors":{"query":["Parse error"]}}
+//
+// Only the first has .find(), so an expired token used to surface as
+// "body.errors.find is not a function" -- a TypeError inside our own error
+// handling, which threw away the one line that said what was actually wrong.
+function normaliseGqlErrors(errors) {
+  if (Array.isArray(errors)) return errors;
+  if (typeof errors === "string") return [{ message: errors }];
+  if (errors && typeof errors === "object") {
+    return Object.entries(errors).flatMap(([field, msgs]) =>
+      (Array.isArray(msgs) ? msgs : [msgs]).map((m) =>
+        (m && typeof m === "object") ? m : { message: `${field}: ${m}` }));
+  }
+  return [{ message: String(errors) }];
+}
+
 export async function graphql(query, variables = {}, attempt = 0, netAttempt = 0) {
   // A retry is only possible if the call actually gives up. Without a
   // deadline a half-open socket can hang until the whole job times out.
@@ -50,6 +73,13 @@ export async function graphql(query, variables = {}, attempt = 0, netAttempt = 0
   // 5xx is Shopify having a moment, not a bad query -- same treatment as a
   // dropped connection rather than a hard failure.
   if (res.status >= 500) return retryNet(`Shopify HTTP ${res.status}`);
+  // Not retryable, and no amount of parsing the body makes it clearer: the
+  // credentials themselves are the problem.
+  if (res.status === 401 || res.status === 403) {
+    throw new Error(`Shopify rejected the credentials (HTTP ${res.status}) — the SHOP_TOKEN secret `
+      + `has expired or is missing a scope. Regenerate the Admin API access token in Shopify and `
+      + `update the repository secret.`);
+  }
 
   let body;
   try {
@@ -66,7 +96,8 @@ export async function graphql(query, variables = {}, attempt = 0, netAttempt = 0
     // callers like getRestockDates(), silently marking every SKU in that
     // chunk as "no restock data found" -- looking identical to a real
     // no-data SKU even though Shopify never actually answered the query.
-    const throttled = body.errors.find((e) => e.extensions?.code === "THROTTLED");
+    const errs = normaliseGqlErrors(body.errors);
+    const throttled = errs.find((e) => e.extensions?.code === "THROTTLED");
     if (throttled && attempt < 5) {
       const resetAt = throttled.extensions?.cost?.windowResetAt;
       const waitMs = resetAt
@@ -76,7 +107,13 @@ export async function graphql(query, variables = {}, attempt = 0, netAttempt = 0
       await sleep(waitMs);
       return graphql(query, variables, attempt + 1, netAttempt);
     }
-    throw new Error("GraphQL errors: " + JSON.stringify(body.errors));
+    const msg = errs.map((e) => e.message || JSON.stringify(e)).join("; ");
+    // Shopify answers an auth failure with HTTP 200 as often as with a 401,
+    // so the same hint has to be available from down here too.
+    const hint = /access token|api key|unrecognized login/i.test(msg)
+      ? " — regenerate the Admin API access token in Shopify and update the SHOP_TOKEN secret."
+      : "";
+    throw new Error(`GraphQL errors (HTTP ${res.status}): ${msg}${hint}`);
   }
 
   // cost-based rate limit: back off if the leaky bucket is running low
