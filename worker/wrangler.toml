@@ -1,3 +1,17 @@
 name = "gearevo-chatbot"
 main = "src/index.js"
 compatibility_date = "2026-01-01"
+
+# Declared here, NOT in the Cloudflare dashboard. A `wrangler deploy` replaces
+# the Worker's bindings with whatever this file declares, so a plain-text
+# variable set through the dashboard is wiped by the next deploy -- silently,
+# and the code then falls back to its built-in defaults. Secrets survive;
+# these do not. Keeping them here makes the deploy the single source of truth
+# and puts the choice of model in git alongside the code that reads it.
+[vars]
+# Chat: per-message and interactive, so cheap and fast matters most.
+OPENROUTER_MODEL = "tencent/hy3"
+# Images: the Duty Roster import, weekly, where a mis-read column corrupts a
+# whole week. Accuracy is worth more than latency or price here -- at roughly
+# one import a week this costs well under a ringgit a month.
+OPENROUTER_VISION_MODEL = "anthropic/claude-sonnet-4.5"
