@@ -387,7 +387,11 @@ const modelFor = (env) => env.OPENROUTER_MODEL || DEFAULT_MODEL;
 // Kept as its own variable rather than forcing one model to satisfy both
 // needs, because the constraints genuinely differ: chat wants speed and tool
 // calling, transcription wants accuracy at reproducing a grid.
-const DEFAULT_VISION_MODEL = "google/gemini-2.5-flash";
+// Pro rather than Flash: this runs when someone imports a roster -- weekly,
+// not per-message -- and a single mis-read column shifts every day after it,
+// which is a quiet, hard-to-spot corruption of the whole week. Accuracy is
+// worth more than latency on this path, and the chat model is separate.
+const DEFAULT_VISION_MODEL = "google/gemini-2.5-pro";
 const visionModelFor = (env) => env.OPENROUTER_VISION_MODEL || DEFAULT_VISION_MODEL;
 
 // Identifies this app on OpenRouter's dashboard, so a spike in spend can be
