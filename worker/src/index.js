@@ -422,6 +422,7 @@ async function consumeStream(stream, onChunk) {
   let content = "";
   const toolCalls = [];
   let finishReason = null;
+  let usage = null;
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -435,6 +436,7 @@ async function consumeStream(stream, onChunk) {
       if (data === "[DONE]") continue;
       let obj;
       try { obj = JSON.parse(data); } catch { continue; }
+      if (obj.usage) usage = obj.usage;
       const choice = obj.choices?.[0];
       if (!choice) continue;
       if (choice.finish_reason) finishReason = choice.finish_reason;
@@ -452,7 +454,7 @@ async function consumeStream(stream, onChunk) {
       }
     }
   }
-  return { content, toolCalls: toolCalls.filter(Boolean), finishReason };
+  return { content, toolCalls: toolCalls.filter(Boolean), finishReason, usage };
 }
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -593,14 +595,19 @@ async function askAssistant(question, image, history, dashboardData, liveToday, 
   // Anthropic's `system` param + cache_control-based prompt caching (frozen
   // prefix / volatile suffix, see the old shared/prompt-caching.md note) had
   // no equivalent confirmed on OpenRouter, so this is now a single system
-  // message like any OpenAI-compatible call -- every question re-sends the
-  // full dashboard snapshot, no caching discount. Content/ordering otherwise
-  // unchanged from the Anthropic version.
-  const instructions = `You are a business analyst assistant for Gearevo, a Malaysian knife/gear retailer selling through Shopify, Shopee, and TikTok Shop. You're answering questions from Gearevo's own staff about their business data, shown inside their internal dashboard.
+  // message like any OpenAI-compatible call.
+  //
+  // Split in two, because caching works on a byte-identical PREFIX: anything
+  // that changes between messages has to sit AFTER everything that doesn't,
+  // or it invalidates the whole cache behind it. So the stable half (the
+  // brief, the tool guidance, the dashboard snapshot) comes first and carries
+  // the cache breakpoint, and the two genuinely volatile things -- today's
+  // date, and the live-today block that refreshes every few minutes -- are
+  // appended after it. The date used to sit in the middle of the brief, which
+  // would have broken the cache once a day for no reason.
+  const instructionsStable = `You are a business analyst assistant for Gearevo, a Malaysian knife/gear retailer selling through Shopify, Shopee, and TikTok Shop. You're answering questions from Gearevo's own staff about their business data, shown inside their internal dashboard.
 
 ${BUSINESS_CONTEXT}
-
-Today's date (MYT): ${todayMYT}. Weeks run Monday-Sunday.
 
 You are given a snapshot of the dashboard's current data as JSON, covering the last 90 days and this month specifically (sales, margin, top products, dead/slow-moving/out-of-stock, customer segments, basket analysis), plus a separate live-today block that's always current (updated within minutes, not tied to the snapshot's own refresh schedule). For anything neither of those covers, use a tool instead of saying the data isn't available:
 - A different time period (this week, last 14 days, a past promotion, etc.) → get_sales_by_date_range for sales/products/services totals.
@@ -613,7 +620,11 @@ Combine tools if a question needs more than one. Answer using only real data (th
 Some long lists in the snapshot are truncated to their most significant entries (largest value, or most urgent). Where that has happened, a matching field ending in "Total" holds the real number of entries -- use it for any count or total, and say the list shown is only the top entries if asked to enumerate them all.
 
 Dashboard snapshot (90-day/this-month window):
-${JSON.stringify(snapshotForPrompt(dashboardData))}
+${JSON.stringify(snapshotForPrompt(dashboardData))}`;
+
+  // Everything below changes between one message and the next, so it lives
+  // outside the cached block.
+  const instructionsVolatile = `Today's date (MYT): ${todayMYT}. Weeks run Monday-Sunday.
 
 Live today (always current):
 ${JSON.stringify(liveToday)}`;
@@ -629,12 +640,32 @@ ${JSON.stringify(liveToday)}`;
   const userContent = image
     ? [{ type: "text", text: question || "What can you tell me about this image?" }, { type: "image_url", image_url: { url: image } }]
     : question;
+  // OpenRouter caches automatically for some providers (OpenAI, Gemini,
+  // DeepSeek, Groq and others) and requires an explicit cache_control
+  // breakpoint for others (Anthropic, Qwen). Which camp tencent/hy3 falls
+  // into isn't documented, but its OpenRouter page prices cache reads, so
+  // caching exists for it either way. Sending the breakpoint covers the
+  // explicit case; providers that cache automatically ignore it.
+  //
+  // The risk is a provider that rejects an ARRAY system message outright, so
+  // systemMessage() can build either shape and the first round falls back to
+  // the plain string if the array is refused. streamOpenRouter() checks
+  // res.ok before returning the body, so a rejection happens before any
+  // output has been streamed -- nothing to undo.
+  const systemMessage = (cached) => (cached
+    ? { role: "system", content: [
+        { type: "text", text: instructionsStable, cache_control: { type: "ephemeral" } },
+        { type: "text", text: instructionsVolatile },
+      ] }
+    : { role: "system", content: `${instructionsStable}\n\n${instructionsVolatile}` });
+  let systemCached = true;
+
   const messages = [
-    { role: "system", content: instructions },
+    systemMessage(true),
     ...(history || []).slice(-CHAT_HISTORY_TURNS).map((m) => ({ role: m.role, content: m.content })),
     { role: "user", content: userContent },
   ];
-  console.log(`chat prompt: ${instructions.length} chars system, `
+  console.log(`chat prompt: ${instructionsStable.length + instructionsVolatile.length} chars system, `
     + `${JSON.stringify(dashboardData).length} chars raw snapshot, model ${modelFor(env)}`);
   emit("status", "Thinking…");
 
@@ -647,7 +678,7 @@ ${JSON.stringify(liveToday)}`;
   // (content was empty throughout, confirmed by testing), there's nothing to
   // undo -- emit("status", ...) below is what fills that round's own silence.
   for (let round = 0; round < 4; round++) {
-    const stream = await streamOpenRouter({
+    const payload = {
       model: modelFor(env),
       // hy3 is a reasoning model -- left enabled, this turned a chat
       // reply into a ~60s round trip for no measurable quality gain
@@ -656,10 +687,36 @@ ${JSON.stringify(liveToday)}`;
       reasoning: { enabled: false },
       max_tokens: 1024,
       tools: [SALES_RANGE_TOOL, CHANNEL_REGION_TOOL, RETURNS_CANCELLED_TOOL, CALENDAR_TOOL, ANNOUNCEMENTS_TOOL],
+      // Asks OpenRouter to report token usage on the stream, so the log below
+      // can say whether the cache was actually read from -- otherwise
+      // "caching is on" is a belief rather than a measurement.
+      usage: { include: true },
       messages,
-    }, apiKey);
+    };
 
-    const { content, toolCalls, finishReason } = await consumeStream(stream, (chunk) => emit("content", chunk));
+    let stream;
+    try {
+      stream = await streamOpenRouter(payload, apiKey);
+    } catch (err) {
+      // A provider that won't take a content-array system message. Flatten it
+      // and carry on uncached rather than failing the whole conversation.
+      if (systemCached && /400|422|invalid|unsupported|content/i.test(err.message)) {
+        console.log("Cache breakpoint refused, retrying with a plain system message:", err.message);
+        systemCached = false;
+        messages[0] = systemMessage(false);
+        stream = await streamOpenRouter(payload, apiKey);
+      } else {
+        throw err;
+      }
+    }
+
+    const { content, toolCalls, finishReason, usage } = await consumeStream(stream, (chunk) => emit("content", chunk));
+    if (usage) {
+      const cached = usage.prompt_tokens_details?.cached_tokens ?? 0;
+      console.log(`round ${round}: ${usage.prompt_tokens} prompt tokens, ${cached} from cache `
+        + `(${usage.prompt_tokens ? Math.round((cached / usage.prompt_tokens) * 100) : 0}%), `
+        + `${usage.completion_tokens} out`);
+    }
 
     if (toolCalls.length) {
       // OpenAI-style: echo the assistant's tool_calls back verbatim, then one
