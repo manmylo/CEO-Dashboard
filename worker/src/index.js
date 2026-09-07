@@ -1493,7 +1493,13 @@ export default {
       try {
         const res = await postOpenRouter({
           model: visionModelFor(env),
-          reasoning: { effort: "none", enabled: false },
+          // Reasoning left ON here, unlike the chat path. Reading a roster
+          // grid is where thinking earns its keep -- lining 35 columns up
+          // against the right staff row is exactly the kind of care that
+          // stops a whole week importing shifted by one day. It also runs
+          // weekly rather than per message, so the extra seconds cost
+          // nothing anyone is sitting and waiting through, and several
+          // endpoints refuse to disable it anyway.
           provider: { sort: "throughput" },
           // A full month's roster transcribed as CSV is long; cutting it
           // off mid-grid would import as a roster with missing days. A model
