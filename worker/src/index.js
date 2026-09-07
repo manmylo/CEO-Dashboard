@@ -403,13 +403,39 @@ const OPENROUTER_HEADERS = (apiKey) => ({
   "X-Title": "Gearevo CEO Dashboard",
 });
 
+// Some endpoints REQUIRE reasoning and reject any attempt to switch it off:
+// "Reasoning is mandatory for this endpoint and cannot be disabled." Which
+// ones is not knowable from here -- it varies by model, and by whichever
+// provider OpenRouter routes to for that model, both of which change without
+// notice. So rather than keep a list that silently goes stale, send the
+// switch, and drop it and retry the once when we are told to.
+//
+// Every OpenRouter call goes through here so the behaviour is identical on
+// all three paths: chat, roster transcription, and PO parsing.
+const REASONING_MANDATORY = /reasoning is mandatory/i;
+
+async function postOpenRouter(payload, apiKey) {
+  const send = (p) => fetch(OPENROUTER_URL, {
+    method: "POST",
+    headers: OPENROUTER_HEADERS(apiKey),
+    body: JSON.stringify(p),
+  });
+  const res = await send(payload);
+  if (res.status !== 400 || !payload.reasoning) return res;
+  // Reading the body to inspect it consumes it, so hand back a fresh
+  // Response when this turns out to be some other 400.
+  const text = await res.text().catch(() => "");
+  if (!REASONING_MANDATORY.test(text)) {
+    return new Response(text, { status: 400, headers: { "Content-Type": "application/json" } });
+  }
+  console.log("Endpoint requires reasoning; retrying without the switch.");
+  const { reasoning, ...withoutReasoning } = payload;
+  return send(withoutReasoning);
+}
+
 async function streamOpenRouter(payload, apiKey) {
   for (let attempt = 0; attempt < 2; attempt++) {
-    const res = await fetch(OPENROUTER_URL, {
-      method: "POST",
-      headers: OPENROUTER_HEADERS(apiKey),
-      body: JSON.stringify({ ...payload, stream: true }),
-    });
+    const res = await postOpenRouter({ ...payload, stream: true }, apiKey);
     if (res.ok) return res.body;
     if (attempt === 0 && (res.status === 429 || res.status >= 500)) {
       await new Promise((r) => setTimeout(r, 1500));
@@ -1104,20 +1130,16 @@ Rules:
 - Ignore supplier/billing addresses, headers, footers, and cost-summary/subtotal/tax rows -- those are not line items.
 - If a field genuinely can't be determined for a line, use "" or 0, but never invent a line item that isn't really in the text.`;
 async function parsePurchaseOrderText(text, apiKey, model) {
-  const res = await fetch(OPENROUTER_URL, {
-    method: "POST",
-    headers: OPENROUTER_HEADERS(apiKey),
-    body: JSON.stringify({
-      model,
-      reasoning: { effort: "none", enabled: false },
-      provider: { sort: "throughput" },
-      max_tokens: 4096,
-      messages: [
-        { role: "system", content: PO_EXTRACT_SYSTEM_PROMPT },
-        { role: "user", content: text.slice(0, 12000) },
-      ],
-    }),
-  });
+  const res = await postOpenRouter({
+    model,
+    reasoning: { effort: "none", enabled: false },
+    provider: { sort: "throughput" },
+    max_tokens: 4096,
+    messages: [
+      { role: "system", content: PO_EXTRACT_SYSTEM_PROMPT },
+      { role: "user", content: text.slice(0, 12000) },
+    ],
+  }, apiKey);
   if (!res.ok) throw new Error(`OpenRouter API error ${res.status}: ${await res.text().catch(() => "")}`);
   const data = await res.json();
   const raw = data.choices?.[0]?.message?.content || "";
@@ -1469,25 +1491,23 @@ export default {
       const prompt = (body.prompt || "").trim();
       if (!prompt) return jsonResponse({ error: "Missing prompt" }, 400);
       try {
-        const res = await fetch(OPENROUTER_URL, {
-          method: "POST",
-          headers: OPENROUTER_HEADERS(env.OPENROUTER_API_KEY),
-          body: JSON.stringify({
-            model: visionModelFor(env),
-            reasoning: { effort: "none", enabled: false },
-            provider: { sort: "throughput" },
-            // A full month's roster transcribed as CSV is long; cutting it
-            // off mid-grid would import as a roster with missing days.
-            max_tokens: 8192,
-            messages: [{
-              role: "user",
-              content: [
-                { type: "text", text: prompt },
-                { type: "image_url", image_url: { url: image } },
-              ],
-            }],
-          }),
-        });
+        const res = await postOpenRouter({
+          model: visionModelFor(env),
+          reasoning: { effort: "none", enabled: false },
+          provider: { sort: "throughput" },
+          // A full month's roster transcribed as CSV is long; cutting it
+          // off mid-grid would import as a roster with missing days. A model
+          // that insists on reasoning spends part of this budget thinking, so
+          // it is generous rather than tight.
+          max_tokens: 16384,
+          messages: [{
+            role: "user",
+            content: [
+              { type: "text", text: prompt },
+              { type: "image_url", image_url: { url: image } },
+            ],
+          }],
+        }, env.OPENROUTER_API_KEY);
         if (!res.ok) {
           const text = await res.text().catch(() => "");
           return jsonResponse({ error: `OpenRouter API error ${res.status}: ${text}` }, res.status);
