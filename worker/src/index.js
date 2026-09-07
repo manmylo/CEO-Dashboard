@@ -378,6 +378,18 @@ const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 const DEFAULT_MODEL = "tencent/hy3";
 const modelFor = (env) => env.OPENROUTER_MODEL || DEFAULT_MODEL;
 
+// Reading an image is a different job from answering a question, and the
+// chat model does not have to be able to do both. tencent/hy3 cannot: every
+// one of its OpenRouter endpoints is filtered out at "Filter by Image
+// Support", so the Duty Roster's screenshot import fails with a 404 no
+// matter how the request is tuned.
+//
+// Kept as its own variable rather than forcing one model to satisfy both
+// needs, because the constraints genuinely differ: chat wants speed and tool
+// calling, transcription wants accuracy at reproducing a grid.
+const DEFAULT_VISION_MODEL = "google/gemini-2.5-flash";
+const visionModelFor = (env) => env.OPENROUTER_VISION_MODEL || DEFAULT_VISION_MODEL;
+
 // Identifies this app on OpenRouter's dashboard, so a spike in spend can be
 // traced to the Worker rather than showing up as anonymous traffic.
 const OPENROUTER_HEADERS = (apiKey) => ({
@@ -679,12 +691,24 @@ ${JSON.stringify(liveToday)}`;
   // undo -- emit("status", ...) below is what fills that round's own silence.
   for (let round = 0; round < 4; round++) {
     const payload = {
-      model: modelFor(env),
-      // hy3 is a reasoning model -- left enabled, this turned a chat
-      // reply into a ~60s round trip for no measurable quality gain
-      // (verified: tool-calling and answer quality both held up fine with
-      // it off). A live chat panel needs to feel responsive.
-      reasoning: { enabled: false },
+      // A pasted image in the chat panel hits the same wall as the roster
+      // import, so a turn carrying one switches to the vision model.
+      model: image ? visionModelFor(env) : modelFor(env),
+      // hy3 is a reasoning model, and left on this turned a chat reply into a
+      // ~60s round trip for no measurable quality gain (verified back on the
+      // previous provider: tool-calling and answer quality both held up fine
+      // with it off). A live chat panel needs to feel responsive.
+      //
+      // effort:"none" is OpenRouter's documented way to stop the tokens being
+      // GENERATED. enabled:false was what the previous provider understood,
+      // and is kept alongside it, but it is not the documented switch here --
+      // and its near neighbour exclude:true only hides the tokens while still
+      // paying the time to produce them, which is the trap this avoids.
+      reasoning: { effort: "none", enabled: false },
+      // Route to whichever provider serves this model fastest. OpenRouter
+      // defaults to its own balance of price and uptime, which can land on a
+      // slow endpoint for a model several providers host.
+      provider: { sort: "throughput" },
       max_tokens: 1024,
       tools: [SALES_RANGE_TOOL, CHANNEL_REGION_TOOL, RETURNS_CANCELLED_TOOL, CALENDAR_TOOL, ANNOUNCEMENTS_TOOL],
       // Asks OpenRouter to report token usage on the stream, so the log below
@@ -713,9 +737,10 @@ ${JSON.stringify(liveToday)}`;
     const { content, toolCalls, finishReason, usage } = await consumeStream(stream, (chunk) => emit("content", chunk));
     if (usage) {
       const cached = usage.prompt_tokens_details?.cached_tokens ?? 0;
+      const reasoned = usage.completion_tokens_details?.reasoning_tokens ?? 0;
       console.log(`round ${round}: ${usage.prompt_tokens} prompt tokens, ${cached} from cache `
         + `(${usage.prompt_tokens ? Math.round((cached / usage.prompt_tokens) * 100) : 0}%), `
-        + `${usage.completion_tokens} out`);
+        + `${usage.completion_tokens} out, ${reasoned} of them reasoning`);
     }
 
     if (toolCalls.length) {
@@ -1080,7 +1105,8 @@ async function parsePurchaseOrderText(text, apiKey, model) {
     headers: OPENROUTER_HEADERS(apiKey),
     body: JSON.stringify({
       model,
-      reasoning: { enabled: false },
+      reasoning: { effort: "none", enabled: false },
+      provider: { sort: "throughput" },
       max_tokens: 4096,
       messages: [
         { role: "system", content: PO_EXTRACT_SYSTEM_PROMPT },
@@ -1443,8 +1469,9 @@ export default {
           method: "POST",
           headers: OPENROUTER_HEADERS(env.OPENROUTER_API_KEY),
           body: JSON.stringify({
-            model: modelFor(env),
-            reasoning: { enabled: false },
+            model: visionModelFor(env),
+            reasoning: { effort: "none", enabled: false },
+            provider: { sort: "throughput" },
             // A full month's roster transcribed as CSV is long; cutting it
             // off mid-grid would import as a roster with missing days.
             max_tokens: 8192,
@@ -1463,7 +1490,7 @@ export default {
         }
         const data = await res.json();
         console.log(`transcribe: ${data.usage?.prompt_tokens ?? "?"} prompt tokens, `
-          + `${data.usage?.completion_tokens ?? "?"} out, model ${modelFor(env)}`);
+          + `${data.usage?.completion_tokens ?? "?"} out, model ${visionModelFor(env)}`);
         return jsonResponse({ text: data.choices?.[0]?.message?.content || "" });
       } catch (e) {
         return jsonResponse({ error: e.message || "Couldn't read that image." }, 500);
