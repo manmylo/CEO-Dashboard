@@ -540,6 +540,53 @@ const TOOL_STATUS = {
   get_calendar_events: "Checking the calendar…",
   get_announcements: "Checking announcements…",
 };
+// Fields in dashboard/latest that exist for OTHER features and are pure
+// lookup tables -- one entry per SKU across the entire catalogue.
+//
+// They are by far the largest thing in the document, and the system prompt
+// re-sends the whole snapshot on EVERY message (there is no caching discount
+// on this path), so they were being charged for, and waited on, in every
+// single reply. The assistant never uses them: it reasons about totals and
+// named lists, never about a raw sku -> number map. skuStock and skuCost feed
+// the D90 export and the Calendar's arrival snapshot; unitsBySkuDate feeds
+// the daily-trend analysis.
+const PROMPT_EXCLUDED = new Set(["skuStock", "skuCost", "unitsBySkuDate"]);
+
+// The rest of the weight is in the long lists. Every one of them arrives
+// ALREADY SORTED by the sync -- dead stock and slow movers by capital tied
+// up, stock-outs by recent demand, vendors by capital, products by revenue --
+// so the head of each list is the part any answer is actually about, and the
+// tail is a long drop of rows nobody asks about individually.
+//
+// Truncating loses one thing worth keeping: the real length. So each capped
+// list gets a sibling `<name>Total`, and the prompt tells the model to use it
+// for counts. That way "how many dead stock items?" is still answered
+// correctly from a list it can only partly see.
+// Recent turns only. The snapshot is re-sent in full every message, so
+// replaying an entire session on top of it made each reply slower than the
+// last. Enough to follow a normal back-and-forth, not the whole transcript.
+const CHAT_HISTORY_TURNS = 10;
+
+const PROMPT_LIST_CAP = {
+  deadStock: 40, slowMoving: 40, stockOut: 40, stockAlerts: 40,
+  vendors: 40, basketAnalysis: 20, topProducts: 20, topProductsMTD: 20,
+};
+
+function snapshotForPrompt(data) {
+  const out = {};
+  for (const [k, v] of Object.entries(data || {})) {
+    if (PROMPT_EXCLUDED.has(k)) continue;
+    const cap = PROMPT_LIST_CAP[k];
+    if (cap && Array.isArray(v) && v.length > cap) {
+      out[k] = v.slice(0, cap);
+      out[`${k}Total`] = v.length;
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
 async function askAssistant(question, image, history, dashboardData, liveToday, idToken, apiKey, env, emit) {
   const todayMYT = new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
@@ -563,8 +610,10 @@ You are given a snapshot of the dashboard's current data as JSON, covering the l
 - Company announcements/bulletin posts → get_announcements.
 Combine tools if a question needs more than one. Answer using only real data (the snapshot, the live-today block, or a tool result) — never invent figures, trends, product names, or calendar/announcement content. If something genuinely can't be answered (e.g. a metric with no historical tracking at all, like stock levels from months ago), say so plainly rather than guessing. Keep answers concise and business-focused, in plain English. Use RM for currency figures, formatted to 2 decimal places.
 
+Some long lists in the snapshot are truncated to their most significant entries (largest value, or most urgent). Where that has happened, a matching field ending in "Total" holds the real number of entries -- use it for any count or total, and say the list shown is only the top entries if asked to enumerate them all.
+
 Dashboard snapshot (90-day/this-month window):
-${JSON.stringify(dashboardData)}
+${JSON.stringify(snapshotForPrompt(dashboardData))}
 
 Live today (always current):
 ${JSON.stringify(liveToday)}`;
@@ -582,9 +631,11 @@ ${JSON.stringify(liveToday)}`;
     : question;
   const messages = [
     { role: "system", content: instructions },
-    ...(history || []).map((m) => ({ role: m.role, content: m.content })),
+    ...(history || []).slice(-CHAT_HISTORY_TURNS).map((m) => ({ role: m.role, content: m.content })),
     { role: "user", content: userContent },
   ];
+  console.log(`chat prompt: ${instructions.length} chars system, `
+    + `${JSON.stringify(dashboardData).length} chars raw snapshot, model ${modelFor(env)}`);
   emit("status", "Thinking…");
 
   // Agentic loop: the assistant may ask for a tool, we run it and feed the
