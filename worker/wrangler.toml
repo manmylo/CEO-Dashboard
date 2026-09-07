@@ -12,6 +12,12 @@ compatibility_date = "2026-01-01"
 # Chat: per-message and interactive, so cheap and fast matters most.
 OPENROUTER_MODEL = "tencent/hy3"
 # Images: the Duty Roster import, weekly, where a mis-read column corrupts a
-# whole week. Accuracy is worth more than latency or price here -- at roughly
-# one import a week this costs well under a ringgit a month.
-OPENROUTER_VISION_MODEL = "anthropic/claude-sonnet-4.5"
+# whole week quietly -- a shifted day looks plausible on screen. Accuracy
+# matters more than latency here, and at one import a week the price barely
+# registers either way (~34 sen a month against ~52 on Sonnet 4.5).
+#
+# Pro cannot turn its thinking off, which is why an earlier attempt died on
+# "Reasoning is mandatory for this endpoint". The transcription path no longer
+# asks it to -- reasoning is deliberately left on there, since lining 35
+# columns up against the right staff row is exactly what it is for.
+OPENROUTER_VISION_MODEL = "google/gemini-2.5-pro"
