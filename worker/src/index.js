@@ -10,11 +10,15 @@
  * duplicate auth/allowlist logic to keep in sync with firestore.rules.
  *
  * Secrets (set via `wrangler secret put`):
- *   ROOTSYS_API_KEY -- rootsys.cloud's OpenAI-compatible endpoint, model
- *   hy3-tencent. Plain fetch (no SDK) against
- *   https://rootsys.cloud/v1/chat/completions, same as the previous
- *   Anthropic integration -- no need to bundle the openai npm package into
- *   this Worker just for one REST call.
+ *   OPENROUTER_API_KEY -- OpenRouter's OpenAI-compatible endpoint. Plain
+ *   fetch (no SDK) against https://openrouter.ai/api/v1/chat/completions --
+ *   no need to bundle the openai npm package into this Worker for one REST
+ *   call.
+ *   OPENROUTER_MODEL (optional) -- the model id, e.g. "tencent/hy3".
+ *   Deliberately a variable rather than a constant: this backend has now
+ *   moved between three providers, and each move was a code change and a
+ *   deploy for what is really one string. Changing model is now an edit in
+ *   the Cloudflare dashboard. Falls back to DEFAULT_MODEL below.
  *   SHOP_DOMAIN, SHOP_TOKEN, SHOP_API_VERSION (optional, e.g. 2026-01) —
  *   same Shopify store/credentials sync.js uses, needed for POST /orders.
  *   GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET, GOOGLE_OAUTH_REFRESH_TOKEN,
@@ -370,14 +374,24 @@ const ANNOUNCEMENTS_TOOL = {
 // (stream: true) -- askAssistant() streams every round, not just the final
 // one, since a round only turns out to be "final text" vs "a tool call"
 // once data starts arriving.
-async function streamRootsys(payload, apiKey) {
+const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
+const DEFAULT_MODEL = "tencent/hy3";
+const modelFor = (env) => env.OPENROUTER_MODEL || DEFAULT_MODEL;
+
+// Identifies this app on OpenRouter's dashboard, so a spike in spend can be
+// traced to the Worker rather than showing up as anonymous traffic.
+const OPENROUTER_HEADERS = (apiKey) => ({
+  "Content-Type": "application/json",
+  Authorization: `Bearer ${apiKey}`,
+  "HTTP-Referer": "https://ceo-dashboard-9e9b4.web.app",
+  "X-Title": "Gearevo CEO Dashboard",
+});
+
+async function streamOpenRouter(payload, apiKey) {
   for (let attempt = 0; attempt < 2; attempt++) {
-    const res = await fetch("https://rootsys.cloud/v1/chat/completions", {
+    const res = await fetch(OPENROUTER_URL, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
+      headers: OPENROUTER_HEADERS(apiKey),
       body: JSON.stringify({ ...payload, stream: true }),
     });
     if (res.ok) return res.body;
@@ -386,7 +400,10 @@ async function streamRootsys(payload, apiKey) {
       continue;
     }
     const text = await res.text().catch(() => "");
-    throw new Error(`rootsys.cloud API error ${res.status}: ${text}`);
+    // The status is carried in the message because it is what tells the
+    // dashboard apart a dead key (401) from an empty account (402) from a
+    // rate limit (429) -- see page-shell.js's assistantErrorText().
+    throw new Error(`OpenRouter API error ${res.status}: ${text}`);
   }
 }
 
@@ -528,7 +545,7 @@ async function askAssistant(question, image, history, dashboardData, liveToday, 
 
   // Anthropic's `system` param + cache_control-based prompt caching (frozen
   // prefix / volatile suffix, see the old shared/prompt-caching.md note) had
-  // no equivalent confirmed on rootsys.cloud, so this is now a single system
+  // no equivalent confirmed on OpenRouter, so this is now a single system
   // message like any OpenAI-compatible call -- every question re-sends the
   // full dashboard snapshot, no caching discount. Content/ordering otherwise
   // unchanged from the Anthropic version.
@@ -552,12 +569,14 @@ ${JSON.stringify(dashboardData)}
 Live today (always current):
 ${JSON.stringify(liveToday)}`;
 
-  // OpenAI-compatible vision content-block shape -- rootsys.cloud describes
-  // itself as OpenAI-compatible and this is the near-universal convention
-  // every such provider follows, but hy3-tencent's own vision support was
-  // never independently confirmed against a real image. If it turns out
-  // unsupported, this fails loudly (a rootsys.cloud API error surfaced via
-  // the existing catch below), not silently.
+  // OpenAI-compatible vision content-block shape, which OpenRouter follows.
+  //
+  // Whether it WORKS depends entirely on the model in OPENROUTER_MODEL: a
+  // text-only model rejects an image_url block outright. The Duty Roster's
+  // image import is the one caller that sends an image, so if that breaks
+  // while the chatbot still answers, the model is the reason. It fails loudly
+  // (an OpenRouter API error surfaced via the existing catch below), never
+  // silently.
   const userContent = image
     ? [{ type: "text", text: question || "What can you tell me about this image?" }, { type: "image_url", image_url: { url: image } }]
     : question;
@@ -577,9 +596,9 @@ ${JSON.stringify(liveToday)}`;
   // (content was empty throughout, confirmed by testing), there's nothing to
   // undo -- emit("status", ...) below is what fills that round's own silence.
   for (let round = 0; round < 4; round++) {
-    const stream = await streamRootsys({
-      model: "hy3-tencent",
-      // hy3-tencent is a reasoning model -- left enabled, this turned a chat
+    const stream = await streamOpenRouter({
+      model: modelFor(env),
+      // hy3 is a reasoning model -- left enabled, this turned a chat
       // reply into a ~60s round trip for no measurable quality gain
       // (verified: tool-calling and answer quality both held up fine with
       // it off). A live chat panel needs to feel responsive.
@@ -947,12 +966,12 @@ Rules:
 - "total" is that line's line-total cost, as a plain number with no currency symbol.
 - Ignore supplier/billing addresses, headers, footers, and cost-summary/subtotal/tax rows -- those are not line items.
 - If a field genuinely can't be determined for a line, use "" or 0, but never invent a line item that isn't really in the text.`;
-async function parsePurchaseOrderText(text, apiKey) {
-  const res = await fetch("https://rootsys.cloud/v1/chat/completions", {
+async function parsePurchaseOrderText(text, apiKey, model) {
+  const res = await fetch(OPENROUTER_URL, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+    headers: OPENROUTER_HEADERS(apiKey),
     body: JSON.stringify({
-      model: "hy3-tencent",
+      model,
       reasoning: { enabled: false },
       max_tokens: 4096,
       messages: [
@@ -961,7 +980,7 @@ async function parsePurchaseOrderText(text, apiKey) {
       ],
     }),
   });
-  if (!res.ok) throw new Error(`rootsys.cloud API error ${res.status}: ${await res.text().catch(() => "")}`);
+  if (!res.ok) throw new Error(`OpenRouter API error ${res.status}: ${await res.text().catch(() => "")}`);
   const data = await res.json();
   const raw = data.choices?.[0]?.message?.content || "";
   // Strip a markdown fence if the model wrapped the JSON in one despite the
@@ -1277,7 +1296,7 @@ export default {
     // text (calendar.js runs pdf.js itself and posts the text here, not the
     // PDF bytes). A hand-written regex/heuristic parser mis-split item
     // names across rows on real store PDFs (confirmed twice against actual
-    // output before this replaced it) -- the same rootsys.cloud model the
+    // output before this replaced it) -- the same model the
     // chatbot uses tolerates jumbled-but-present table text far better than
     // any fixed pattern.
     if (pathname === "/parse-po") {
@@ -1285,7 +1304,7 @@ export default {
       if (!text) return jsonResponse({ error: "Missing text" }, 400);
       if (!(await verifyAuth(idToken))) return jsonResponse({ error: "Not authorized." }, 403);
       try {
-        const result = await parsePurchaseOrderText(text, env.ROOTSYS_API_KEY);
+        const result = await parsePurchaseOrderText(text, env.OPENROUTER_API_KEY, modelFor(env));
         return jsonResponse(result);
       } catch (e) {
         return jsonResponse({ error: e.message || "Couldn't parse that PDF." }, 500);
@@ -1339,7 +1358,7 @@ export default {
     // call's own round-trip is otherwise completely silent -- see
     // askAssistant()'s TOOL_STATUS -- overwritten/cleared on the client,
     // never saved). app.js parses this line-by-line. Errors that happen
-    // AFTER streaming has started (rootsys.cloud dies mid-answer) can't
+    // AFTER streaming has started (OpenRouter dies mid-answer) can't
     // change the HTTP status at that point, so they're appended as a
     // content line instead; anything that fails BEFORE streaming starts
     // (auth, the Firestore snapshot fetch above) still returns a normal
@@ -1353,7 +1372,7 @@ export default {
       ctx.waitUntil((async () => {
         try {
           await askAssistant(
-            question, image, body.history, firestoreResult.data, liveToday, idToken, env.ROOTSYS_API_KEY, env, emit
+            question, image, body.history, firestoreResult.data, liveToday, idToken, env.OPENROUTER_API_KEY, env, emit
           );
         } catch (e) {
           await emit("content", `\n\n[Error: ${e.message || "Chat failed."}]`);
