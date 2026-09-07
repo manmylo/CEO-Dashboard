@@ -1419,6 +1419,57 @@ export default {
       }
     }
 
+    // Reading a picture of a roster has nothing to do with the business
+    // analyst. It used to go through the chat endpoint, which meant every
+    // import downloaded the whole dashboard snapshot from Firestore (836KB of
+    // JSON), built a 60KB system prompt out of it, and attached all five
+    // business tools -- none of which the model needs to transcribe a grid,
+    // and all of which it had to read before it could start.
+    //
+    // This path sends the prompt and the image, and nothing else.
+    if (pathname === "/transcribe") {
+      if (!(await verifyAuth(idToken))) return jsonResponse({ error: "Not authorized." }, 403);
+      const image = body.image;
+      if (typeof image !== "string" || !/^data:image\/(jpeg|png);base64,/.test(image)) {
+        return jsonResponse({ error: "Image must be a JPEG or PNG data URL." }, 400);
+      }
+      if (image.length > 11 * 1024 * 1024) {
+        return jsonResponse({ error: "Image is too large (max 8MB)." }, 400);
+      }
+      const prompt = (body.prompt || "").trim();
+      if (!prompt) return jsonResponse({ error: "Missing prompt" }, 400);
+      try {
+        const res = await fetch(OPENROUTER_URL, {
+          method: "POST",
+          headers: OPENROUTER_HEADERS(env.OPENROUTER_API_KEY),
+          body: JSON.stringify({
+            model: modelFor(env),
+            reasoning: { enabled: false },
+            // A full month's roster transcribed as CSV is long; cutting it
+            // off mid-grid would import as a roster with missing days.
+            max_tokens: 8192,
+            messages: [{
+              role: "user",
+              content: [
+                { type: "text", text: prompt },
+                { type: "image_url", image_url: { url: image } },
+              ],
+            }],
+          }),
+        });
+        if (!res.ok) {
+          const text = await res.text().catch(() => "");
+          return jsonResponse({ error: `OpenRouter API error ${res.status}: ${text}` }, res.status);
+        }
+        const data = await res.json();
+        console.log(`transcribe: ${data.usage?.prompt_tokens ?? "?"} prompt tokens, `
+          + `${data.usage?.completion_tokens ?? "?"} out, model ${modelFor(env)}`);
+        return jsonResponse({ text: data.choices?.[0]?.message?.content || "" });
+      } catch (e) {
+        return jsonResponse({ error: e.message || "Couldn't read that image." }, 500);
+      }
+    }
+
     if (pathname === "/product-images") {
       const skus = Array.isArray(body.skus) ? body.skus : [];
       if (!(await verifyAuth(idToken))) return jsonResponse({ error: "Not authorized." }, 403);
