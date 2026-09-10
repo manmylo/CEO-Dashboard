@@ -546,3 +546,51 @@ exports.cleanupD90OnCardDelete = onDocumentDeleted("calendarCards/{cardId}", asy
   await batch.commit();
   logger.info(`cleanupD90OnCardDelete: card ${cardId} -> removed ${snap.size} D90 entr(ies)`);
 });
+
+// ---------- Session log retention ----------
+// The session log records one document per event -- a sign-in, a page load, a
+// token renewal -- so it grows with every day of normal use. It exists to
+// diagnose a live problem, not to be an archive, and ten days is comfortably
+// longer than the loop of "someone reports a logout, we go and look".
+//
+// Deleted server-side because nothing else can: firestore.rules refuses
+// update and delete on this collection to everyone, admins included, so the
+// log cannot be quietly edited after the fact. The Admin SDK bypasses rules,
+// which is exactly the right place for a retention policy to live -- one
+// scheduled job, not a button someone could point at the wrong day.
+const { onSchedule } = require("firebase-functions/v2/scheduler");
+
+const SESSION_LOG_KEEP_DAYS = 10;
+const SESSION_LOG_BATCH = 400;   // Firestore caps a batch at 500 writes
+
+exports.pruneSessionLog = onSchedule(
+  { schedule: "every day 03:30", timeZone: "Asia/Kuala_Lumpur" },
+  async () => {
+    const cutoff = new Date(Date.now() - SESSION_LOG_KEEP_DAYS * 24 * 60 * 60 * 1000).toISOString();
+    const db = admin.firestore();
+    let deleted = 0;
+
+    // Paged rather than one big query: a backlog could be far larger than a
+    // single batch, and each pass re-queries from the start because the
+    // previous pass has removed everything it saw.
+    for (;;) {
+      const snap = await db.collection("sessionLog")
+        .where("at", "<", cutoff)          // `at` is an ISO string, so this orders correctly as text
+        .orderBy("at")
+        .limit(SESSION_LOG_BATCH)
+        .get();
+      if (snap.empty) break;
+
+      const batch = db.batch();
+      snap.docs.forEach((d) => batch.delete(d.ref));
+      await batch.commit();
+      deleted += snap.size;
+
+      // A short pass means the collection is drained; stop rather than
+      // spending another round trip to be told the same thing.
+      if (snap.size < SESSION_LOG_BATCH) break;
+    }
+
+    logger.info(`pruneSessionLog: removed ${deleted} entries older than ${cutoff}`);
+  }
+);
